@@ -19,7 +19,7 @@ parser.add_argument('--num_tokens', type=int, default=32)
 parser.add_argument('--model_dim', type=int, default=512)
 parser.add_argument('--hidden_size', type=int, default=512)
 parser.add_argument('--num_local_experts', type=int, default=2)
-parser.add_argument('--dtype', type=str, default='float32')
+parser.add_argument('--dtype', type=str, default='bfloat16')
 parser.add_argument('--top', type=int, default=2)
 parser.add_argument('--mode', type=str, default='single')
 parser.add_argument('--expert_shape', type=str, default='abc-abd')
@@ -64,7 +64,7 @@ class FFN(nn.Module):
 
 
 x = torch.tensor(torch.zeros([batch_size, num_tokens, model_dim], dtype=torch.float32, device='cpu').detach(
-).numpy(), dtype=torch.get_default_dtype(), requires_grad=False, device=device)
+).numpy(), dtype=torch.bfloat16, requires_grad=False, device=device)
 ct = model_dim // num_local_experts
 tmp_cnt = num_tokens // (num_local_experts * dist_world_size // args.top)
 print(ct, tmp_cnt, num_tokens)
@@ -94,17 +94,18 @@ class ExampleModel(torch.nn.Module):
         #                       expert_shape=args.expert_shape).to(device)
         num_moe_experts = 4
         transformer_config = TransformerConfig(
-            num_layers=4,
+            num_layers=2,
             hidden_size=512,
             num_attention_heads=4,
             num_moe_experts=num_moe_experts,
             use_cpu_initialization=True,
             activation_func=torch.nn.functional.silu,
-            gated_linear_unit=True,
+            gated_linear_unit=False,
             bias_activation_fusion=True,
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=2,
             moe_grouped_gemm=True,
+            add_bias_linear=False,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=True)
@@ -116,7 +117,7 @@ class ExampleModel(torch.nn.Module):
 
 
 torch.manual_seed(dist_rank)
-model = ExampleModel().cuda()
+model = ExampleModel().cuda().to(torch.bfloat16)
 
 
 if args.expert_shape in ['ab->ac']:
