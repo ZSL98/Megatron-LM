@@ -164,6 +164,7 @@ class GroupedMLP(MegatronModule):
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
+        print("tokens_per_expert: ", tokens_per_expert, " GroupedMLP-rank: ", torch.distributed.get_rank())
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.
             w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
@@ -413,6 +414,7 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert = tokens_per_expert.tolist()
+        print("tokens_per_expert: ", tokens_per_expert, " TEGroupedMLP-rank: ", torch.distributed.get_rank())
         intermediate_parallel, bias_parallel = self.linear_fc1(
             permuted_local_hidden_states, tokens_per_expert
         )
@@ -502,6 +504,7 @@ class SequentialMLP(MegatronModule):
             self.local_experts.append(expert)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
+        print("tokens_per_expert: ", tokens_per_expert, " SequentialMLP-rank: ", torch.distributed.get_rank())
 
         output_local = torch.zeros_like(permuted_local_hidden_states)
         output_bias_local = None
