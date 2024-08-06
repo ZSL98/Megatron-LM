@@ -164,7 +164,7 @@ class GroupedMLP(MegatronModule):
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
-        print("tokens_per_expert: ", tokens_per_expert, " GroupedMLP-rank: ", torch.distributed.get_rank())
+        print("GroupedMLP-rank: ", torch.distributed.get_rank())
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.
             w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)

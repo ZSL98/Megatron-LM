@@ -78,7 +78,7 @@ parser.add_argument('--hidden_size', type=int, default=1024)
 parser.add_argument('--num_local_experts', type=int, default=8) # equals to num_moe_experts//ep_world_size
 parser.add_argument('--num_moe_experts', type=int, default=32)
 parser.add_argument('--dtype', type=str, default='bfloat16')
-parser.add_argument('--topk', type=int, default=1)
+parser.add_argument('--topk', type=int, default=5)
 parser.add_argument('--mode', type=str, default='single')
 parser.add_argument('--expert_shape', type=str, default='abc-abd')
 parser.add_argument("--weight_groups", default=1, type=int, help="num of weight groups")
@@ -147,10 +147,13 @@ if __name__ == "__main__":
         moe_router_load_balancing_type="sinkhorn",
         moe_router_topk=args.topk,
         moe_grouped_gemm=True,
+        moe_extended_tp=False,
         add_bias_linear=False,
     )
 
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=4, expert_model_parallel_size=1)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=4)
+    # print(get_expert_model_parallel_world_size())
+    # print(get_expert_model_parallel_group())
     megatron_moe = MoE_layer_megatron(transformer_config).cuda().to(torch.bfloat16)
 
     if args.expert_shape in ['ab->ac']:
