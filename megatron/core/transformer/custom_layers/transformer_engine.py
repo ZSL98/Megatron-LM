@@ -31,7 +31,6 @@ def get_te_version():
             return str(te.__version__)
         else:
             return version("transformer-engine")
-
     return packaging.version.Version(get_te_version_str())
 
 
@@ -573,7 +572,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             return core_attn_out
 
 
-if _te_version >= packaging.version.Version("1.9.0.dev0"):
+if _te_version >= packaging.version.Version("1.8.0.dev0"):
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """

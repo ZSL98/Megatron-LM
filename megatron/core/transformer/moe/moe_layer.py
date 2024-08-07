@@ -109,6 +109,7 @@ class MoELayer(BaseMoELayer):
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
                 hidden_states, probs, indices
             )
+            tokens_per_expert = torch.tensor([800, 800, 800, 800, 800, 800, 800, 800])
             print("dispatched_input: ", dispatched_input.size(), "; tokens_per_expert: ", tokens_per_expert, "; rank: ", torch.distributed.get_rank())
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
@@ -120,3 +121,66 @@ class MoELayer(BaseMoELayer):
             output, mlp_bias = custom_forward(hidden_states)
 
         return output, mlp_bias
+
+class MoELayer_wo_gate(BaseMoELayer):
+    """Mixture of experts Layer **currently only supports no token dropping**.
+
+    Args:
+        BaseMoELayer (MegatronModule): Base class for MoE layers
+    """
+
+    def __init__(
+        self, config: TransformerConfig, submodules: MLPSubmodules = None, layer_number: int = None
+    ):
+        self.submodules = submodules
+        print(self.submodules)
+        super(MoELayer_wo_gate, self).__init__(config=config, layer_number=layer_number)
+        self.router = TopKRouter(config=self.config)
+        if self.config.moe_grouped_gemm:
+            if isinstance(self.submodules, MLPSubmodules):
+                self.experts = TEGroupedMLP(self.num_local_experts, self.config, self.submodules)
+            else:
+                self.experts = GroupedMLP(self.num_local_experts, self.config)
+        else:
+            assert isinstance(self.submodules, MLPSubmodules)
+            self.experts = SequentialMLP(self.num_local_experts, self.config, self.submodules)
+        if config.moe_token_dispatcher_type == "allgather":
+            self.token_dispatcher = MoEAllGatherTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices, config=self.config
+            )
+        elif config.moe_token_dispatcher_type == "alltoall":
+            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices, config=self.config
+            )
+        else:
+            raise ValueError(
+                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
+            )
+        self.moe_layer_recompute = config.moe_layer_recompute
+
+    def forward(self, dispatched_input: torch.Tensor, tokens_per_expert):
+        if (
+            self.training
+            and self.config.tensor_model_parallel_size > 1
+            and not self.config.sequence_parallel
+        ):
+            raise ValueError(
+                "During training, performance may degrade if MoE and tensor parallelism"
+                "are enabled without also enabling sequence parallelism."
+            )
+
+        # process MoE
+        def custom_forward(dispatched_input, tokens_per_expert):
+            # probs, indices = self.router(hidden_states)
+            # (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
+            #     hidden_states, probs, indices
+            # )
+            # tokens_per_expert = torch.tensor([3200, 3200, 3200, 3200, 3200, 3200, 3200, 3200])
+            # print("dispatched_input: ", dispatched_input.size(), "; tokens_per_expert: ", tokens_per_expert, "; rank: ", torch.distributed.get_rank())
+            expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
+            # output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+            return expert_output
+
+        expert_output = custom_forward(dispatched_input, tokens_per_expert)
+
+        return expert_output

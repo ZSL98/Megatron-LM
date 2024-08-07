@@ -71,10 +71,10 @@ parser.add_argument('--local_rank', type=int, default=-1)
 parser.add_argument('--world_size', type=int, default=8)
 parser.add_argument('--ep_world_size', type=int, default=4)
 parser.add_argument('--tp_world_size', type=int, default=2)
-parser.add_argument('--batch_size', type=int, default=8)
-parser.add_argument('--num_tokens', type=int, default=1024)
-parser.add_argument('--model_dim', type=int, default=1024)
-parser.add_argument('--hidden_size', type=int, default=1024)
+parser.add_argument('--batch_size', type=int, default=2)
+parser.add_argument('--num_tokens', type=int, default=5120)
+parser.add_argument('--model_dim', type=int, default=5120)
+parser.add_argument('--hidden_size', type=int, default=5120)
 parser.add_argument('--num_local_experts', type=int, default=8) # equals to num_moe_experts//ep_world_size
 parser.add_argument('--num_moe_experts', type=int, default=32)
 parser.add_argument('--dtype', type=str, default='bfloat16')
@@ -227,6 +227,9 @@ class MoeMlp1Ctx:
         assert self.ntokens % self.tp_size == 0
         self.ntokens_shard = self.ntokens // self.tp_size
 
+        if RANK == 0:
+            print("self.tp_size: ", self.tp_size)
+
         device = torch.cuda.current_device()
 
         init_tensor_ctx = nullcontext
@@ -252,7 +255,7 @@ class MoeMlp1Ctx:
 
             self.splits_cpu: torch.Tensor = moe_utils.generate_splits(dist, b, s, topk, nexperts)
             self.splits_gpu = self.splits_cpu.to(device)
-            # torch.distributed.broadcast(self.splits_gpu, src=0, group=get_tensor_model_parallel_group())
+            torch.distributed.broadcast(self.splits_gpu, src=0, group=TP_GROUP)
             self.splits_cpu = self.splits_gpu.cpu()
             self.nrows_ep = torch.sum(
                 self.splits_cpu[
@@ -319,9 +322,10 @@ class MoE_layer_megatron(torch.nn.Module):
 
 
 class MoE_layer_flux(torch.nn.Module):
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, ctx):
         super().__init__()
 
+        self.ctx = ctx
         input_dtype = INP_DTYPE_MAP[args.dtype]
         output_dtype = OUT_DTYPE_MAP[args.dtype]
         tp_group = TP_GROUP
@@ -341,12 +345,12 @@ class MoE_layer_flux(torch.nn.Module):
         #     args.num_local_experts, [i for i in range(eid_start, eid_end)], config=config
         # )
 
-        self.split_cpu, _, _, _, self.routing_idx = randomGateFunc(
-            args.batch_size * args.num_tokens // args.topk, args.num_moe_experts, args.topk
-        )
+        # self.splits_cpu, _, _, _, self.routing_idx = randomGateFunc(
+        #     args.batch_size * args.num_tokens // args.topk, args.num_moe_experts, args.topk
+        # )
 
         tp_env = flux.DistEnvTPWithEP(tp_group=tp_group, nnodes=1, ep_group=ep_group)
-        flux_m_max = args.batch_size * args.num_tokens
+        flux_m_max = args.batch_size * args.num_tokens * args.topk
         bf16_moe_args = flux.MoeArguments(
             max_ntokens=flux_m_max // args.topk,
             hidden=args.hidden_size,
@@ -358,7 +362,10 @@ class MoE_layer_flux(torch.nn.Module):
         )
         self.flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env, bf16_moe_args)
 
-        M_cur_ep_rank = torch.sum(self.split_cpu[eid_start:eid_end]).item()
+        # if RANK == 0:
+        #     print("eid_start, eid_end ", eid_start, " ", eid_end)
+
+        M_cur_ep_rank = torch.sum(self.ctx.splits_cpu[eid_start:eid_end]).item()
         local_K = args.model_dim // args.tp_world_size
         self._input = torch.rand((M_cur_ep_rank, local_K), dtype=input_dtype).cuda() - 0.5
         self._weight = torch.rand((n_experts_per_rank, args.model_dim, local_K), dtype=input_dtype).cuda() - 0.5
@@ -367,7 +374,7 @@ class MoE_layer_flux(torch.nn.Module):
                                                 args.tp_world_size, args.ep_world_size, 1)
 
 
-    def forward(self, hidden_states, ctx):
+    def forward(self, hidden_states):
 
 
         # moe gate
@@ -393,21 +400,22 @@ class MoE_layer_flux(torch.nn.Module):
         # reshaped_gate_weight = gathered_gate_weight.reshape(-1, 1)
         # scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
 
-        probs, indices = self.router(hidden_states)
+        # probs, indices = self.router(hidden_states)
         # (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
         #     hidden_states, probs, indices
         # )
-        if RANK == 0:
-            print("probs: ", probs.size())
-            print("indices: ", indices.size())
+
+        # if RANK == 0:
+        #     print("probs: ", probs.size())
+        #     print("indices: ", indices.size())
 
         self.flux_ag_op.forward_multiple_weights(
-            inputs_shard=ctx.inputs_shard,
-            weights=ctx.weights,
-            splits_gpu=ctx.splits_gpu,
-            scatter_index=ctx.scatter_index,
+            inputs_shard=self.ctx.inputs_shard,
+            weights=self.ctx.weights,
+            splits_gpu=self.ctx.splits_gpu,
+            scatter_index=self.ctx.scatter_index,
             output_scale=None,
-            outputs_buf=ctx.outputs,
+            outputs_buf=self.ctx.outputs,
             fast_accum=False,
         )
 
@@ -415,15 +423,16 @@ class MoE_layer_flux(torch.nn.Module):
         #     ctx.outputs[0], ctx.outputs[1], scattered_gate_weight
         # )
 
-        if RANK == 0:
-            print("_input shape: ", self._input.size())
-            print("_weight shape", self._weight.size())
+        # if RANK == 0:
+        #     print("_input shape: ", self._input.size())
+        #     print("_weight shape: ", self._weight.size())
+        #     print("self.ctx.scatter_index: ", self.ctx.scatter_index.size())
 
         mlp_output = self.flux_rs_op.forward_gather_rs(
             self._input,
             self._weight,
-            self.split_cpu,
-            self.routing_idx,
+            self.ctx.splits_cpu,
+            self.ctx.scatter_index.view(-1),
             None,
             None,
             None,
@@ -443,7 +452,7 @@ if __name__ == "__main__":
     ).numpy(), dtype=torch.bfloat16, requires_grad=False, device=device)
     ct = model_dim // num_local_experts
     tmp_cnt = num_tokens // (num_local_experts * DIST_ENV.get_world().size() // args.topk)
-    print(ct, tmp_cnt, num_tokens)
+    # print(ct, tmp_cnt, num_tokens)
     # construct special input
     for j in range(num_tokens):
 
@@ -487,10 +496,30 @@ if __name__ == "__main__":
     )
 
     # megatron_moe = MoE_layer_megatron(transformer_config).cuda().to(torch.bfloat16)
-    flux_moe = MoE_layer_flux(transformer_config).cuda().to(torch.bfloat16)
+    flux_moe = MoE_layer_flux(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
 
     if args.expert_shape in ['ab->ac']:
         x = x.reshape(-1, args.model_dim)
     # output1 = megatron_moe(x)
-    output2 = flux_moe(x, moe_ctx)
 
+    for i in range(5):
+        output2 = flux_moe(x)
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
+
+    start_event.record()
+    iters = 10
+    for i in range(iters):
+        torch.distributed.barrier()
+        output2 = flux_moe(x)
+
+    end_event.record()
+    end_event.synchronize()
+
+    elapsed_time = start_event.elapsed_time(end_event)
+    if RANK == 0:
+        print("Elapsed time: ", elapsed_time / iters)
