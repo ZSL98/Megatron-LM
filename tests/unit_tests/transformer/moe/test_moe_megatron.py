@@ -14,7 +14,7 @@ import time
 import argparse
 
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate, MoELayer_wo_gate_v2
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -126,6 +126,7 @@ class MoE_layer_megatron_wo_gate(torch.nn.Module):
             num_experts=args.num_moe_experts, moe_grouped_gemm=True)
         # self._moe_layer = MoELayer(config, transformer_layer_spec.submodules.mlp.submodules)
         self._moe_layer = MoELayer_wo_gate(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
+        # self._moe_layer = MoELayer_wo_gate_v2(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
 
     def forward(self, dispatched_input, tokens_per_expert):
         result = self._moe_layer(dispatched_input, tokens_per_expert)
@@ -133,9 +134,6 @@ class MoE_layer_megatron_wo_gate(torch.nn.Module):
 
 
 if __name__ == "__main__":
-
-    linear_fc1 = TEColumnParallelGroupedLinear
-    print("linear_fc1: ", linear_fc1)
 
     # x = torch.tensor(torch.zeros([batch_size, num_tokens, model_dim], dtype=torch.float32, device='cpu').detach(
     # ).numpy(), dtype=torch.bfloat16, requires_grad=False, device=device)
@@ -155,7 +153,7 @@ if __name__ == "__main__":
     #         x[:, j, ct * (t_idx * args.topk):ct * ((t_idx + 1) * args.topk)] = (t_idx + 1) / 5
 
 
-    x = torch.tensor(torch.zeros([batch_size * num_tokens // args.tp_world_size //args.ep_world_size, model_dim], dtype=torch.float32, device='cpu').detach(
+    x = torch.tensor(torch.zeros([batch_size * num_tokens // args.tp_world_size // args.ep_world_size, model_dim], dtype=torch.float32, device='cpu').detach(
     ).numpy(), dtype=torch.bfloat16, requires_grad=False, device=device)
 
     transformer_config = TransformerConfig(
@@ -181,18 +179,18 @@ if __name__ == "__main__":
     # print(get_expert_model_parallel_world_size())
     # print(get_tensor_model_parallel_world_size())
 
-    # dispatched_input = torch.rand((args.batch_size * args.num_tokens * args.topk//8, args.model_dim), dtype=torch.bfloat16).cuda()
-    # tokens_per_expert = torch.tensor([800, 800, 800, 800, 800, 800, 800, 800])
+    dispatched_input = torch.rand((args.batch_size * args.num_tokens * args.topk // args.ep_world_size, args.model_dim), dtype=torch.bfloat16).cuda()
+    tokens_per_expert = torch.tensor([1600, 1600, 1600, 1600, 1600, 1600, 1600, 1600])
 
-    megatron_moe = MoE_layer_megatron(transformer_config).cuda().to(torch.bfloat16)
-    # megatron_moe = MoE_layer_megatron_wo_gate(transformer_config).cuda().to(torch.bfloat16)
+    # megatron_moe = MoE_layer_megatron(transformer_config).cuda().to(torch.bfloat16)
+    megatron_moe = MoE_layer_megatron_wo_gate(transformer_config).cuda().to(torch.bfloat16)
 
     if args.expert_shape in ['ab->ac']:
         x = x.reshape(-1, args.model_dim)
 
     for i in range(5):
-        output1 = megatron_moe(x)
-        # output1 = megatron_moe(dispatched_input, tokens_per_expert)
+        # output1 = megatron_moe(x)
+        output1 = megatron_moe(dispatched_input, tokens_per_expert)
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -204,8 +202,8 @@ if __name__ == "__main__":
     iters = 10
     for i in range(iters):
         torch.distributed.barrier()
-        output1 = megatron_moe(x)
-        # output1 = megatron_moe(dispatched_input, tokens_per_expert)
+        # output1 = megatron_moe(x)
+        output1 = megatron_moe(dispatched_input, tokens_per_expert)
 
     end_event.record()
     end_event.synchronize()

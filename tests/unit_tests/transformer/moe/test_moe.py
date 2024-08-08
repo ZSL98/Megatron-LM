@@ -13,7 +13,7 @@ from random import randint
 import argparse
 
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate, MoELayer_wo_gate_v2
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -100,8 +100,8 @@ hidden_size = args.hidden_size
 num_local_experts = args.num_local_experts
 top_value = args.topk
 device = torch.cuda.current_device()
+torch.manual_seed(RANK)
 
-parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
 # model_parallel_cuda_manual_seed(123)
 
 def init_ep_group(ep_size: int):
@@ -131,6 +131,25 @@ class NopAsyncHandle:
     # unified interfaces with nccl handle
     def wait(self):
         pass
+
+
+def generate_choosed_experts(splits, num_tokens, topk, device):
+    # scatter_index(dst2src): [B*S, K]
+    # scatter_weight: [B*S, K]
+    # gather_index(src2dst): [B*S*K, ]
+    # gather_weight: [B*S*K, ]
+
+    # generate choosed experts
+    choosed_experts = torch.zeros((num_tokens, topk), dtype=torch.int64)
+    bin_counter = torch.clone(splits)
+    offsets = torch.cumsum(splits, dim=0) - splits
+    for tid in range(num_tokens):
+        bin_size, bins = torch.topk(bin_counter, topk)
+        choosed_experts[tid] = bins
+        bin_counter[bins] -= 1
+
+    return choosed_experts
+
 
 
 def tp_allgather(input_, group=None, sync=True):
@@ -218,6 +237,8 @@ class MoeMlp1Ctx:
         self.tp_size = TP_GROUP.size()
         self.ep_rank = EP_GROUP.rank()
         self.ep_size = EP_GROUP.size()
+
+        print("self.ep_size: ", self.tp_size, self.ep_size)
         self.ffn_tp_size = self.tp_size // self.ep_size
         self.nexperts_ep = self.nexperts // self.ep_size
         assert self.nexperts % self.ep_size == 0
@@ -269,10 +290,13 @@ class MoeMlp1Ctx:
             self.scatter_index = moe_utils.generate_scatter_index(
                 self.splits_cpu, self.ntokens, self.topk, device
             ).to(torch.int32)
+            self.choosed_experts = generate_choosed_experts(
+                self.splits_cpu, self.ntokens, self.topk, device
+            )[self.ep_rank * 1280 : (self.ep_rank+1) * 1280].to(torch.int32).cuda()
 
-            gate_weight = torch.rand((self.ntokens, topk), dtype=input_dtype, device=device)
+            self.gate_weight = torch.rand((self.ntokens, topk), dtype=input_dtype, device=device)
             gather_index, _ = moe_utils.calculate_gather_index_weight(
-                self.scatter_index, gate_weight
+                self.scatter_index, self.gate_weight
             )
             self.gather_index = gather_index.to(torch.int32)
 
@@ -289,6 +313,16 @@ class MoeMlp1Ctx:
                 torch.zeros((self.nrows_ep, self.ffn_size_shard), dtype=output_dtype, device=device)
                 for _ in range(weight_groups)
             ]
+
+            print("self.nrows_ep: ", self.nrows_ep, " ", self.ffn_size_shard)
+
+            torch.distributed.all_gather_into_tensor(self.inputs, self.inputs_shard, group=TP_GROUP)
+            self.scatter_inputs.copy_(torch.index_select(self.inputs, dim=0, index=self.gather_index))
+            self.dispatched_input = self.scatter_inputs[self.ep_rank * 12800 : self.ep_rank * 12800 + 12800]
+            self.tokens_per_expert = torch.tensor([1600, 1600, 1600, 1600, 1600, 1600, 1600, 1600])
+
+            # if torch.distributed.get_rank() == 1:
+            #     print("self.dispatched_input: ", self.dispatched_input, self.dispatched_input.size())
 
             torch.cuda.synchronize()
 
@@ -319,6 +353,33 @@ class MoE_layer_megatron(torch.nn.Module):
         return result
 
 
+class MoE_layer_megatron_wo_gate(torch.nn.Module):
+    def __init__(self, config, ctx):
+        super().__init__()
+
+        self.ctx = ctx
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=args.num_moe_experts, moe_grouped_gemm=True)
+        # self._moe_layer = MoELayer(config, transformer_layer_spec.submodules.mlp.submodules)
+        self._moe_layer = MoELayer_wo_gate(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
+
+    def forward(self):
+        result = self._moe_layer(self.ctx.dispatched_input, self.ctx.tokens_per_expert)
+        return result
+
+class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
+    def __init__(self, config, ctx):
+        super().__init__()
+
+        self.ctx = ctx
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=args.num_moe_experts, moe_grouped_gemm=True)
+        self._moe_layer = MoELayer_wo_gate_v2(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
+
+    def forward(self):
+        reshaped_tensor = self.ctx.inputs_shard.reshape(640, 2, 5120)
+        result = self._moe_layer(self.ctx.gate_weight, self.ctx.choosed_experts, reshaped_tensor)
+        return result
 
 
 class MoE_layer_flux(torch.nn.Module):
@@ -376,35 +437,6 @@ class MoE_layer_flux(torch.nn.Module):
 
     def forward(self, hidden_states):
 
-
-        # moe gate
-        # num_experts = gate_wg.shape[-1]
-        # wg_running = 0.5 * (gate_wg_ema + gate_wg.float())
-        # logits_fp32 = torch.matmul(ln2_output.reshape(-1, hidden_size).float(), wg_running)
-        # logits = logits_fp32.bfloat16()
-        # gathered_logits, handle_logits = tp_allgather(logits, sync=False)
-        # gates = torch.nn.functional.softmax(logits_fp32, dim=1)
-        # values, indices_long = torch.topk(gates, k=args.topk, dim=-1, sorted=False)
-        # indices = indices_long.int()
-        # gathered_indices, handle_indices = tp_allgather(indices, sync=False)
-        # gate_weight_fp32 = (values / torch.sum(values, dim=-1, keepdim=True))
-        # gate_weight = gate_weight_fp32.bfloat16()
-        # gathered_gate_weight, handle_gate_weight = tp_allgather(gate_weight, sync=False)
-        # handle_logits.wait()
-        # handle_indices.wait()
-        # splits = torch.ops.FasterMoe.expert_histogram(gathered_indices, args.num_moe_experts)
-        # scatter_index = torch.ops.FasterMoe.index_compute(gathered_indices, splits)
-        # splits_cpu = torch.empty(splits.size(), dtype=splits.dtype, pin_memory=True)
-        # splits_cpu.copy_(splits, non_blocking=True)
-        # handle_gate_weight.wait()
-        # reshaped_gate_weight = gathered_gate_weight.reshape(-1, 1)
-        # scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
-
-        # probs, indices = self.router(hidden_states)
-        # (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
-        #     hidden_states, probs, indices
-        # )
-
         # if RANK == 0:
         #     print("probs: ", probs.size())
         #     print("indices: ", indices.size())
@@ -445,9 +477,6 @@ class MoE_layer_flux(torch.nn.Module):
 
 if __name__ == "__main__":
 
-    flux.init_flux_shm(TP_GROUP)
-    init_ep_group(args.num_local_experts)
-
     x = torch.tensor(torch.zeros([batch_size, num_tokens, model_dim], dtype=torch.float32, device='cpu').detach(
     ).numpy(), dtype=torch.bfloat16, requires_grad=False, device=device)
     ct = model_dim // num_local_experts
@@ -465,7 +494,6 @@ if __name__ == "__main__":
             t_idx = j // tmp_cnt
             x[:, j, ct * (t_idx * args.topk):ct * ((t_idx + 1) * args.topk)] = (t_idx + 1) / 5
 
-
     transformer_config = TransformerConfig(
         num_layers=2,
         hidden_size=args.hidden_size,
@@ -473,13 +501,23 @@ if __name__ == "__main__":
         num_moe_experts=args.num_moe_experts,
         use_cpu_initialization=True,
         activation_func=torch.nn.functional.silu,
-        gated_linear_unit=False,
+        gated_linear_unit=True,
         bias_activation_fusion=True,
-        moe_router_load_balancing_type="sinkhorn",
+        moe_router_load_balancing_type="none",
         moe_router_topk=args.topk,
         moe_grouped_gemm=True,
+        moe_extended_tp=False,
         add_bias_linear=False,
+        tensor_model_parallel_size=2,
+        expert_model_parallel_size=4,
+        sequence_parallel=True,
     )
+
+
+    flux.init_flux_shm(TP_GROUP)
+    # # init_ep_group(args.num_local_experts)
+    init_ep_group(args.ep_world_size)
+    # parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
 
     moe_ctx = MoeMlp1Ctx(
         b=args.batch_size,
@@ -495,31 +533,43 @@ if __name__ == "__main__":
         weight_groups=args.weight_groups,
     )
 
-    # megatron_moe = MoE_layer_megatron(transformer_config).cuda().to(torch.bfloat16)
     flux_moe = MoE_layer_flux(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
+    output2 = flux_moe(x)
 
-    if args.expert_shape in ['ab->ac']:
-        x = x.reshape(-1, args.model_dim)
-    # output1 = megatron_moe(x)
+    # if args.expert_shape in ['ab->ac']:
+    #     x = x.reshape(-1, args.model_dim)
 
-    for i in range(5):
-        output2 = flux_moe(x)
+    # for i in range(5):
+    #     output2 = flux_moe(x)
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    # start_event = torch.cuda.Event(enable_timing=True)
+    # end_event = torch.cuda.Event(enable_timing=True)
 
-    torch.distributed.barrier()
-    torch.cuda.synchronize()
+    # torch.distributed.barrier()
+    # torch.cuda.synchronize()
 
-    start_event.record()
-    iters = 10
-    for i in range(iters):
-        torch.distributed.barrier()
-        output2 = flux_moe(x)
+    # start_event.record()
+    # iters = 10
+    # for i in range(iters):
+    #     torch.distributed.barrier()
+    #     output2 = flux_moe(x)
 
-    end_event.record()
-    end_event.synchronize()
+    # end_event.record()
+    # end_event.synchronize()
 
-    elapsed_time = start_event.elapsed_time(end_event)
+    # elapsed_time = start_event.elapsed_time(end_event)
     if RANK == 0:
-        print("Elapsed time: ", elapsed_time / iters)
+        print("moe_ctx.outputs shape:", moe_ctx.outputs[0].size())
+        print(moe_ctx.outputs[0])
+        # print("Elapsed time: ", elapsed_time / iters)
+
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=4)
+    # megatron_moe = MoE_layer_megatron_wo_gate(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
+    # print("choosed_experts: ", moe_ctx.choosed_experts, moe_ctx.choosed_experts.size())
+    # print("gate_weight: ", moe_ctx.gate_weight, moe_ctx.gate_weight.size())
+    megatron_moe = MoE_layer_megatron_wo_gate_v2(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
+    output1 = megatron_moe()
+
+    # if RANK == 0:
+    #     print("output1 shape:", output1.size())
+    #     print(output1)

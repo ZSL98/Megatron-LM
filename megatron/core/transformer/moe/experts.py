@@ -414,10 +414,13 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert = tokens_per_expert.tolist()
-        print("tokens_per_expert: ", tokens_per_expert, " TEGroupedMLP-rank: ", torch.distributed.get_rank())
+        # print("tokens_per_expert: ", tokens_per_expert, " TEGroupedMLP-rank: ", torch.distributed.get_rank())
         intermediate_parallel, bias_parallel = self.linear_fc1(
             permuted_local_hidden_states, tokens_per_expert
         )
+
+        if torch.distributed.get_rank() == 0:
+            print("intermediate_parallel: ", intermediate_parallel.size(), intermediate_parallel)
 
         if self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:
@@ -504,7 +507,7 @@ class SequentialMLP(MegatronModule):
             self.local_experts.append(expert)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
-        print("tokens_per_expert: ", tokens_per_expert, " SequentialMLP-rank: ", torch.distributed.get_rank())
+        # print("tokens_per_expert: ", tokens_per_expert, " SequentialMLP-rank: ", torch.distributed.get_rank())
 
         output_local = torch.zeros_like(permuted_local_hidden_states)
         output_bias_local = None
