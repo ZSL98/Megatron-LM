@@ -153,7 +153,7 @@ if __name__ == "__main__":
     #         x[:, j, ct * (t_idx * args.topk):ct * ((t_idx + 1) * args.topk)] = (t_idx + 1) / 5
 
 
-    x = torch.tensor(torch.zeros([batch_size * num_tokens // args.tp_world_size // args.ep_world_size, model_dim], dtype=torch.float32, device='cpu').detach(
+    x = torch.tensor(torch.zeros([batch_size * num_tokens // args.ep_world_size, model_dim], dtype=torch.float32, device='cpu').detach(
     ).numpy(), dtype=torch.bfloat16, requires_grad=False, device=device)
 
     transformer_config = TransformerConfig(
@@ -163,9 +163,9 @@ if __name__ == "__main__":
         num_moe_experts=args.num_moe_experts,
         use_cpu_initialization=True,
         activation_func=torch.nn.functional.gelu,
-        gated_linear_unit=True,
-        bias_activation_fusion=True,
-        moe_router_load_balancing_type="sinkhorn",
+        gated_linear_unit=False,
+        bias_activation_fusion=False,
+        moe_router_load_balancing_type="none",
         moe_router_topk=args.topk,
         moe_grouped_gemm=True,
         moe_extended_tp=False,
@@ -182,15 +182,18 @@ if __name__ == "__main__":
     dispatched_input = torch.rand((args.batch_size * args.num_tokens * args.topk // args.ep_world_size, args.model_dim), dtype=torch.bfloat16).cuda()
     tokens_per_expert = torch.tensor([1600, 1600, 1600, 1600, 1600, 1600, 1600, 1600])
 
-    # megatron_moe = MoE_layer_megatron(transformer_config).cuda().to(torch.bfloat16)
-    megatron_moe = MoE_layer_megatron_wo_gate(transformer_config).cuda().to(torch.bfloat16)
+    megatron_moe = MoE_layer_megatron(transformer_config).cuda().to(torch.bfloat16)
+    # megatron_moe = MoE_layer_megatron_wo_gate(transformer_config).cuda().to(torch.bfloat16)
 
     if args.expert_shape in ['ab->ac']:
         x = x.reshape(-1, args.model_dim)
 
+    output1 = megatron_moe(x)
+    exit()
+
     for i in range(5):
-        # output1 = megatron_moe(x)
-        output1 = megatron_moe(dispatched_input, tokens_per_expert)
+        output1 = megatron_moe(x)
+        # output1 = megatron_moe(dispatched_input, tokens_per_expert)
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -202,8 +205,8 @@ if __name__ == "__main__":
     iters = 10
     for i in range(iters):
         torch.distributed.barrier()
-        # output1 = megatron_moe(x)
-        output1 = megatron_moe(dispatched_input, tokens_per_expert)
+        output1 = megatron_moe(x)
+        # output1 = megatron_moe(dispatched_input, tokens_per_expert)
 
     end_event.record()
     end_event.synchronize()
