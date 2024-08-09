@@ -447,17 +447,18 @@ class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
             print("t_tokens: ", t_tokens, t_tokens.size())
             print("t_topk_index:", t_topk_index, t_topk_index.size())
             print("t_routing_index:", t_routing_index, t_topk_index.size())
-            print("self.ctx.scatter_index:", self.ctx.scatter_index, self.ctx.scatter_index.size())
-        full_output = torch.zeros((51200, 5120), dtype=result.dtype).cuda()
+            print("self.ctx.scatter_index:", self.ctx.scatter_index.view(-1), self.ctx.scatter_index.view(-1).size())
+        full_output = torch.zeros((51200, 5120), dtype=result.dtype, device=self.ctx.inputs_shard.device)
         new_index = (
             args.topk * t_tokens[0:12800]
             + t_topk_index[0:12800]
         )
         if torch.distributed.get_rank() == 0:
             print("new_index: ", new_index, new_index.size())
-        output1 = full_output
+        output1 = torch.zeros_like(full_output)
         output1[new_index] = result
-        topk_reduce = output1.view((full_output.size(0) // args.topk, args.topk, full_output.size(1))).sum(1)
+        full_output += output1
+        topk_reduce = full_output.view((full_output.size(0) // args.topk, args.topk, full_output.size(1))).sum(1)
         output2 = torch.zeros(
             (full_output.size(0) // TP_GROUP.size() // args.topk, full_output.size(1)),
             dtype=topk_reduce.dtype,
