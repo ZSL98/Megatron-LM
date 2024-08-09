@@ -249,7 +249,7 @@ class MoELayer_wo_gate_v2(BaseMoELayer):
                 print("dispatched_input: ", dispatched_input.size(), "; tokens_per_expert: ", tokens_per_expert, "; rank: ", torch.distributed.get_rank())
                 # print("dispatched_input: ", dispatched_input, dispatched_input.size())
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
-            # print("expert_output: ", expert_output.size())
+            print("expert_output: ", expert_output.size())
             # output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
             # print("outputoutput: ", output.size())
             return expert_output

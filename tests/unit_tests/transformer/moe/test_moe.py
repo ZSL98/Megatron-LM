@@ -434,14 +434,27 @@ class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
 
         t_tokens = torch.tensor(sum(exp_tokens, []), dtype=torch.int32).cuda()
         t_topk_index = torch.tensor(sum(top_index, []), dtype=torch.int32).cuda()
+
+        routing_idx = [0] * (10240 * 5)
+        for i in range(10240 * 5):
+            token_id = t_tokens[i].item()
+            topk_id = t_topk_index[i].item()
+            pos = token_id * args.topk + topk_id
+            routing_idx[pos] = i
+        t_routing_index = torch.tensor(routing_idx, dtype=torch.int32).cuda()
         if RANK == 0:
-            print("t_tokens: ", t_tokens)
-            print("t_topk_index:", t_topk_index)
+            print("choosed_experts_all_token: ", self.ctx.choosed_experts_all_token, self.ctx.choosed_experts_all_token.size())
+            print("t_tokens: ", t_tokens, t_tokens.size())
+            print("t_topk_index:", t_topk_index, t_topk_index.size())
+            print("t_routing_index:", t_routing_index, t_topk_index.size())
+            print("self.ctx.scatter_index:", self.ctx.scatter_index, self.ctx.scatter_index.size())
         full_output = torch.zeros((51200, 5120), dtype=result.dtype).cuda()
         new_index = (
             args.topk * t_tokens[0:12800]
             + t_topk_index[0:12800]
         )
+        if torch.distributed.get_rank() == 0:
+            print("new_index: ", new_index, new_index.size())
         output1 = full_output
         output1[new_index] = result
         topk_reduce = output1.view((full_output.size(0) // args.topk, args.topk, full_output.size(1))).sum(1)
