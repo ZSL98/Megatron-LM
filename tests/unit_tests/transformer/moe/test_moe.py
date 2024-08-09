@@ -314,9 +314,36 @@ class MoeMlp1Ctx:
             )
             self.scatter_index = self.scatter_index.to(torch.int32)
 
-            if self.tp_rank == 0:
+            exp_tokens = [[] for _ in range(args.num_moe_experts)]
+            top_index = [[] for _ in range(args.num_moe_experts)]
+            for tid in range(len(self.choosed_experts_all_token)):
+                for _rank, eid in enumerate(self.choosed_experts_all_token[tid]):
+                    exp_tokens[eid].append(tid)
+                    top_index[eid].append(_rank)
+
+            t_tokens = torch.tensor(sum(exp_tokens, []), dtype=torch.int32).cuda()
+            t_topk_index = torch.tensor(sum(top_index, []), dtype=torch.int32).cuda()
+
+            routing_idx = [0] * (10240 * 5)
+            for i in range(10240 * 5):
+                token_id = t_tokens[i].item()
+                topk_id = t_topk_index[i].item()
+                pos = token_id * args.topk + topk_id
+                routing_idx[pos] = i
+            t_routing_index = torch.tensor(routing_idx, dtype=torch.int32).cuda()
+
+            self.new_index = (
+                args.topk * t_tokens[0:12800]
+                + t_topk_index[0:12800]
+            )
+
+            if RANK == 0:
+                print("t_tokens: ", t_tokens, t_tokens.size())
+                print("t_topk_index:", t_topk_index, t_topk_index.size())
+                print("t_routing_index:", t_routing_index, t_topk_index.size())
+                print("self.scatter_index:", self.scatter_index.view(-1), self.scatter_index.view(-1).size())
+                print("new_index: ", self.new_index, self.new_index.size())
                 print("Splits:", self.splits_cpu.tolist(), "Sum:", sum(self.splits_cpu.tolist()))
-                print("scatter_index:", self.scatter_index, self.scatter_index.size())
                 print("choosed_experts_all_token:", self.choosed_experts_all_token, self.choosed_experts_all_token.size())
             # self.choosed_experts_all_token = generate_choosed_experts(self.splits_cpu, self.ntokens, self.topk, device)
             self.choosed_experts = self.choosed_experts_all_token[self.ep_rank * 1280 : (self.ep_rank+1) * 1280].to(torch.int32).cuda()
@@ -332,9 +359,9 @@ class MoeMlp1Ctx:
             tp_rank = TP_GROUP.rank() % args.tp_world_size
             eid_start = ep_rank * n_experts_per_rank
             eid_end = eid_start + n_experts_per_rank
-            M_cur_ep_rank = torch.sum(self.splits_cpu[eid_start:eid_end]).item()
-            local_K = args.model_dim // args.tp_world_size
-            self._input = torch.rand((M_cur_ep_rank, local_K), dtype=input_dtype).cuda() - 0.5
+            M_cur_ep_rank = torch.sum(self.splits_cpu[eid_start:eid_end]).item() # 12800
+            local_K = args.model_dim // args.tp_world_size # 2560
+            self.gelu_output = torch.zeros((M_cur_ep_rank, local_K), dtype=input_dtype).cuda()
             self._weight = torch.rand((n_experts_per_rank, args.model_dim, local_K), dtype=input_dtype).cuda() - 0.5
 
 
@@ -368,6 +395,43 @@ class MoeMlp1Ctx:
 
     def get_outputs_clone(self):
         return [out.clone() for out in self.outputs]
+
+def perf_torch(ctx: MoeMlp1Ctx):
+    input = ctx.gelu_output  # From Flux phase1
+    weight = ctx._weight
+    gemm_only_op = flux.GemmOnly(torch.bfloat16, torch.bfloat16)
+
+    acc = 0
+    output_list = []
+    full_output = torch.zeros((51200, 5120), dtype=torch.bfloat16, device=input.device)
+    for exp_id in range(weight.size(0)):
+        exp_w = weight[exp_id]
+        Mi = ctx.splits_cpu[exp_id + TP_GROUP.rank() // 2 * 8]
+        exp_input = input[acc : acc + Mi]
+        acc += Mi
+        output_list.append(torch.matmul(exp_input, exp_w.t()))
+
+    output = torch.concat(output_list)
+    if RANK == 0:
+        print("output: ", output, output.size())
+    output1 = torch.zeros_like(full_output)
+    output1[ctx.new_index] = output
+    full_output += output1
+    topk_reduce = full_output.view(
+        (full_output.size(0) // args.topk, args.topk, full_output.size(1))
+    ).sum(1)
+    output2 = torch.zeros(
+        (full_output.size(0) // TP_GROUP.size() // args.topk, full_output.size(1)),
+        dtype=topk_reduce.dtype,
+        device=torch.cuda.current_device(),
+        requires_grad=False,
+    )
+    torch.distributed.reduce_scatter_tensor(output2, topk_reduce, group=TP_GROUP)
+
+    if RANK == 0:
+        print("output2: ", output2, output2.size())
+
+    return output2
 
 
 class MoE_layer_megatron(torch.nn.Module):
@@ -425,38 +489,9 @@ class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
         # self.ctx.choosed_experts_all_token = self.ctx.choosed_experts_all_token.cuda()
         result = self._moe_layer(self.ctx.gate_weight, self.ctx.choosed_experts, reshaped_tensor)
 
-        exp_tokens = [[] for _ in range(args.num_moe_experts)]
-        top_index = [[] for _ in range(args.num_moe_experts)]
-        for tid in range(len(self.ctx.choosed_experts_all_token)):
-            for _rank, eid in enumerate(self.ctx.choosed_experts_all_token[tid]):
-                exp_tokens[eid].append(tid)
-                top_index[eid].append(_rank)
-
-        t_tokens = torch.tensor(sum(exp_tokens, []), dtype=torch.int32).cuda()
-        t_topk_index = torch.tensor(sum(top_index, []), dtype=torch.int32).cuda()
-
-        routing_idx = [0] * (10240 * 5)
-        for i in range(10240 * 5):
-            token_id = t_tokens[i].item()
-            topk_id = t_topk_index[i].item()
-            pos = token_id * args.topk + topk_id
-            routing_idx[pos] = i
-        t_routing_index = torch.tensor(routing_idx, dtype=torch.int32).cuda()
-        if RANK == 0:
-            print("choosed_experts_all_token: ", self.ctx.choosed_experts_all_token, self.ctx.choosed_experts_all_token.size())
-            print("t_tokens: ", t_tokens, t_tokens.size())
-            print("t_topk_index:", t_topk_index, t_topk_index.size())
-            print("t_routing_index:", t_routing_index, t_topk_index.size())
-            print("self.ctx.scatter_index:", self.ctx.scatter_index.view(-1), self.ctx.scatter_index.view(-1).size())
         full_output = torch.zeros((51200, 5120), dtype=result.dtype, device=self.ctx.inputs_shard.device)
-        new_index = (
-            args.topk * t_tokens[0:12800]
-            + t_topk_index[0:12800]
-        )
-        if torch.distributed.get_rank() == 0:
-            print("new_index: ", new_index, new_index.size())
         output1 = torch.zeros_like(full_output)
-        output1[new_index] = result
+        output1[self.ctx.new_index] = result
         full_output += output1
         topk_reduce = full_output.view((full_output.size(0) // args.topk, args.topk, full_output.size(1))).sum(1)
         output2 = torch.zeros(
@@ -528,7 +563,7 @@ class MoE_layer_flux(torch.nn.Module):
             fast_accum=False,
         )
 
-        gelu_output = self.activation_func(self.ctx.outputs[0])
+        self.ctx.gelu_output = self.activation_func(self.ctx.outputs[0])
 
         # weighted_gelu_output = torch.ops.FasterTransformer.GatedLinearUnit_forward_swiglu(
         #     ctx.outputs[0], ctx.outputs[1], scattered_gate_weight
@@ -538,9 +573,9 @@ class MoE_layer_flux(torch.nn.Module):
         #     print("self.ctx.scatter_index: ", self.ctx.scatter_index.size())
 
         if RANK == 2:
-            print("Flux gelu_output: ", gelu_output.size(), gelu_output)
+            print("Flux gelu_output: ", self.ctx.gelu_output.size(), self.ctx.gelu_output)
         mlp_output = self.flux_rs_op.forward_gather_rs(
-            gelu_output,
+            self.ctx.gelu_output,
             self.ctx._weight,
             self.ctx.splits_cpu,
             self.ctx.scatter_index.view(-1),
@@ -650,8 +685,10 @@ if __name__ == "__main__":
     # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
     output2 = megatron_moe()
 
+    perf_torch(moe_ctx)
+
 
     # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
     if RANK == 0:
-        print("Flux output shape: ", output1.size(), output1)
+        # print("Flux output shape: ", output1.size(), output1)
         print("Megatron output shape: ", output2.size(), output2)
