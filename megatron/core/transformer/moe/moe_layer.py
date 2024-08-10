@@ -237,9 +237,9 @@ class MoELayer_wo_gate_v2(BaseMoELayer):
         # process MoE
         def custom_forward(probs, indices, hidden_states):
             probs0, indices0 = self.router(hidden_states)
-            if torch.distributed.get_rank() == 0:
-                print("probs size: ", probs0.size(), probs0)
-                print("indices size: ", indices.size(), indices)
+            # if torch.distributed.get_rank() == 0:
+            #     print("probs size: ", probs0.size(), probs0)
+            #     print("indices size: ", indices.size(), indices)
                 # print("hidden_states size: ", hidden_states.size(), hidden_states)
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
                 hidden_states, probs0, indices
@@ -249,7 +249,7 @@ class MoELayer_wo_gate_v2(BaseMoELayer):
                 print("dispatched_input: ", dispatched_input.size(), "; tokens_per_expert: ", tokens_per_expert, "; rank: ", torch.distributed.get_rank())
                 # print("dispatched_input: ", dispatched_input, dispatched_input.size())
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
-            print("expert_output: ", expert_output.size())
+            # print("expert_output: ", expert_output.size())
             # output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
             # print("outputoutput: ", output.size())
             return expert_output

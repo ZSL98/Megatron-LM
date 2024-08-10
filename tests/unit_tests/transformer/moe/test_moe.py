@@ -332,9 +332,16 @@ class MoeMlp1Ctx:
                 routing_idx[pos] = i
             t_routing_index = torch.tensor(routing_idx, dtype=torch.int32).cuda()
 
+            eid_start = self.ep_rank * 8
+            ep_rank_m_start = 0
+            for i in range(eid_start):
+                ep_rank_m_start += self.splits_cpu[i]
+            M_cur_ep_rank = 12800 # This can vary
+            ep_rank_m_end = ep_rank_m_start + M_cur_ep_rank
+
             self.new_index = (
-                args.topk * t_tokens[0:12800]
-                + t_topk_index[0:12800]
+                args.topk * t_tokens[ep_rank_m_start:ep_rank_m_end]
+                + t_topk_index[ep_rank_m_start:ep_rank_m_end]
             )
 
             if RANK == 0:
@@ -396,10 +403,10 @@ class MoeMlp1Ctx:
     def get_outputs_clone(self):
         return [out.clone() for out in self.outputs]
 
+
 def perf_torch(ctx: MoeMlp1Ctx):
     input = ctx.gelu_output  # From Flux phase1
     weight = ctx._weight
-    gemm_only_op = flux.GemmOnly(torch.bfloat16, torch.bfloat16)
 
     acc = 0
     output_list = []
@@ -412,13 +419,13 @@ def perf_torch(ctx: MoeMlp1Ctx):
         output_list.append(torch.matmul(exp_input, exp_w.t()))
 
     output = torch.concat(output_list)
-    if RANK == 0:
-        print("output: ", output, output.size())
+    # if RANK == 0:
+    #     print("output: ", output, output.size())
     output1 = torch.zeros_like(full_output)
     output1[ctx.new_index] = output
     full_output += output1
     topk_reduce = full_output.view(
-        (full_output.size(0) // args.topk, args.topk, full_output.size(1))
+        (51200 // 5, 5, 5120)
     ).sum(1)
     output2 = torch.zeros(
         (full_output.size(0) // TP_GROUP.size() // args.topk, full_output.size(1)),
@@ -429,10 +436,35 @@ def perf_torch(ctx: MoeMlp1Ctx):
     torch.distributed.reduce_scatter_tensor(output2, topk_reduce, group=TP_GROUP)
 
     if RANK == 0:
-        print("output2: ", output2, output2.size())
+        print("perf_torch output: ", output2, output2.size())
 
     return output2
 
+
+def perf_flux(ctx: MoeMlp1Ctx):
+
+    input = ctx.gelu_output  # From Flux phase1
+    weight = ctx._weight
+
+    op = flux.GemmGroupedV3GatherRS(
+        32, 2*5120*5, 5120, 5, RANK, 8, 2, 4, 1
+    )
+
+    output = op.forward_gather_rs(
+        input,
+        weight,
+        ctx.splits_cpu,
+        ctx.scatter_index.view(-1),
+        None,
+        None,
+        None,
+        False,
+    )
+
+    if RANK == 0:
+        print("perf_flux output: ", output, output.size())
+
+    return output
 
 class MoE_layer_megatron(torch.nn.Module):
     def __init__(self, config):
@@ -649,6 +681,8 @@ if __name__ == "__main__":
 
     flux_moe = MoE_layer_flux(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
     output1 = flux_moe(x)
+    perf_flux(moe_ctx)
+    perf_torch(moe_ctx)
 
     # if args.expert_shape in ['ab->ac']:
     #     x = x.reshape(-1, args.model_dim)
@@ -685,10 +719,8 @@ if __name__ == "__main__":
     # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
     output2 = megatron_moe()
 
-    perf_torch(moe_ctx)
-
 
     # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
     if RANK == 0:
-        # print("Flux output shape: ", output1.size(), output1)
+        print("Flux output shape: ", output1.size(), output1)
         print("Megatron output shape: ", output2.size(), output2)
