@@ -77,10 +77,10 @@ class GroupedMLP(MegatronModule):
         fc1_output_size_per_partition = divide(fc1_output_size, tp_size)
 
 
-        print("self.config.ffn_hidden_size: ", self.config.ffn_hidden_size)
-        print("fc1_output_size: ", fc1_output_size)
-        print("fc1_output_size_per_partition: ", fc1_output_size_per_partition)
-        print("tp_size: ", tp_size)
+        # print("self.config.ffn_hidden_size: ", self.config.ffn_hidden_size)
+        # print("fc1_output_size: ", fc1_output_size)
+        # print("fc1_output_size_per_partition: ", fc1_output_size_per_partition)
+        # print("tp_size: ", tp_size)
 
         fc2_input_size = self.config.ffn_hidden_size * self.num_local_experts
         fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
@@ -105,25 +105,25 @@ class GroupedMLP(MegatronModule):
                     dtype=config.params_dtype,
                 )
             )
-            # if config.perform_initialization:
-            #     _initialize_affine_weight_cpu(
-            #         self.weight1,
-            #         self.config.hidden_size,
-            #         fc1_output_size,
-            #         fc1_output_size_per_partition,
-            #         partition_dim=1,
-            #         init_method=config.init_method,
-            #         params_dtype=config.params_dtype,
-            #     )
-            #     _initialize_affine_weight_cpu(
-            #         self.weight2,
-            #         fc2_input_size,
-            #         self.config.hidden_size,
-            #         fc2_input_size_per_partition,
-            #         partition_dim=0,
-            #         init_method=config.output_layer_init_method,
-            #         params_dtype=config.params_dtype,
-            #     )
+            if config.perform_initialization:
+                _initialize_affine_weight_cpu(
+                    self.weight1,
+                    self.config.hidden_size,
+                    fc1_output_size,
+                    fc1_output_size_per_partition,
+                    partition_dim=1,
+                    init_method=config.init_method,
+                    params_dtype=config.params_dtype,
+                )
+                _initialize_affine_weight_cpu(
+                    self.weight2,
+                    fc2_input_size,
+                    self.config.hidden_size,
+                    fc2_input_size_per_partition,
+                    partition_dim=0,
+                    init_method=config.output_layer_init_method,
+                    params_dtype=config.params_dtype,
+                )
             # if torch.distributed.get_rank() == 0:
             #     print("weight1: ", self.weight1.size(), self.weight1)
         else:
@@ -178,15 +178,15 @@ class GroupedMLP(MegatronModule):
             w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
             w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
 
-            if torch.distributed.get_rank() == 0:
-                print("w1: ", w1.size(), w1)
+            # if torch.distributed.get_rank() == 0:
+            #     print("w1: ", w1.size(), w1)
             
             fc1_output = gg.ops.gmm(
                 permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
             )
 
-            if torch.distributed.get_rank() == 0:
-                print("fc1_output: ", fc1_output.size(), fc1_output)
+            # if torch.distributed.get_rank() == 0:
+            #     print("fc1_output: ", fc1_output.size(), fc1_output)
 
             intermediate_parallel = self.activation_func(fc1_output)
 
@@ -461,12 +461,12 @@ class TEGroupedMLP(MegatronModule):
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
-        if torch.distributed.get_rank() == 2:
-            print("Megatron gelu_output: ", intermediate_parallel.size(), intermediate_parallel)
+        # if torch.distributed.get_rank() == 2:
+        #     print("Megatron gelu_output: ", intermediate_parallel.size(), intermediate_parallel)
 
         output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
 
-        return output, output_bias
+        return output, intermediate_parallel # This should be output_bias!
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

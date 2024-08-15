@@ -13,9 +13,6 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 import argparse
 
-from megatron.training import print_rank_0
-from megatron.training.initialize import initialize_megatron
-from megatron.core import mpu, tensor_parallel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate, MoELayer_wo_gate_v2
 from megatron.core.transformer.moe.router import TopKRouter
@@ -73,13 +70,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--dist", type=str, default="uniform")
 parser.add_argument('--local_rank', type=int, default=-1)
 parser.add_argument('--world_size', type=int, default=8)
-parser.add_argument('--ep_world_size', type=int, default=1)
-parser.add_argument('--tp_world_size', type=int, default=8)
+parser.add_argument('--ep_world_size', type=int, default=4)
+parser.add_argument('--tp_world_size', type=int, default=2)
 parser.add_argument('--batch_size', type=int, default=2)
 parser.add_argument('--num_tokens', type=int, default=5120)
 parser.add_argument('--model_dim', type=int, default=5120)
 parser.add_argument('--hidden_size', type=int, default=5120)
-# parser.add_argument('--num_local_experts', type=int, default=8) # equals to num_moe_experts//ep_world_size
+parser.add_argument('--num_local_experts', type=int, default=8) # equals to num_moe_experts//ep_world_size
 parser.add_argument('--num_moe_experts', type=int, default=32)
 parser.add_argument('--dtype', type=str, default='bfloat16')
 parser.add_argument('--topk', type=int, default=5)
@@ -101,6 +98,7 @@ batch_size = args.batch_size
 num_tokens = args.num_tokens
 model_dim = args.model_dim
 hidden_size = args.hidden_size
+num_local_experts = args.num_local_experts
 top_value = args.topk
 device = torch.cuda.current_device()
 torch.manual_seed(RANK)
@@ -134,31 +132,6 @@ class NopAsyncHandle:
     # unified interfaces with nccl handle
     def wait(self):
         pass
-
-def initialize_tp_communicators():
-    """ initializing the communicators with user buffers for high-performance tensor-model-parallel
-        communication overlap """
-
-    try:
-       import yaml
-
-       import transformer_engine
-       from transformer_engine.pytorch import module as te_module
-
-    except ImportError:
-       raise RuntimeError("Tensor Parallel Communication/GEMM Overlap optimization needs 'yaml' and "
-             "'transformer_engine' packages")
-
-
-    ub_cfgs = {}
-    input_shape = [(args.num_tokens * args.batch_size), args.hidden_size]
-
-    #We create a MPI process group, which is needed to bootstrap the pipelined
-    #tensor-model-parallel communication overlap
-    # torch.distributed.new_group(backend='mpi')
-
-    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tp_world_size,
-                                 use_fp8 = False , ub_cfgs = ub_cfgs,)
 
 
 def generate_choosed_experts(splits, num_tokens, topk, device):
@@ -300,6 +273,9 @@ class MoeMlp1Ctx:
         assert self.ntokens % self.tp_size == 0
         self.ntokens_shard = self.ntokens // self.tp_size
 
+        if RANK == 0:
+            print("self.tp_size: ", self.tp_size)
+
         device = torch.cuda.current_device()
 
         init_tensor_ctx = nullcontext
@@ -348,21 +324,19 @@ class MoeMlp1Ctx:
             t_tokens = torch.tensor(sum(exp_tokens, []), dtype=torch.int32).cuda()
             t_topk_index = torch.tensor(sum(top_index, []), dtype=torch.int32).cuda()
 
-            routing_idx = [0] * (batch_size * num_tokens * topk)
-            for i in range(batch_size * num_tokens * topk):
+            routing_idx = [0] * (10240 * 5)
+            for i in range(10240 * 5):
                 token_id = t_tokens[i].item()
                 topk_id = t_topk_index[i].item()
                 pos = token_id * args.topk + topk_id
                 routing_idx[pos] = i
             t_routing_index = torch.tensor(routing_idx, dtype=torch.int32).cuda()
 
-            eid_start = self.ep_rank * self.nexperts_ep
-            eid_end = eid_start + self.nexperts_ep
+            eid_start = self.ep_rank * 8
             ep_rank_m_start = 0
             for i in range(eid_start):
                 ep_rank_m_start += self.splits_cpu[i]
-            M_cur_ep_rank = torch.sum(self.splits_cpu[eid_start:eid_end]).item()
-            # print("M_cur_ep_rank: ", M_cur_ep_rank)
+            M_cur_ep_rank = 12800 # This can vary
             ep_rank_m_end = ep_rank_m_start + M_cur_ep_rank
 
             self.new_index = (
@@ -379,9 +353,7 @@ class MoeMlp1Ctx:
                 print("Splits:", self.splits_cpu.tolist(), "Sum:", sum(self.splits_cpu.tolist()))
                 print("choosed_experts_all_token:", self.choosed_experts_all_token, self.choosed_experts_all_token.size())
             # self.choosed_experts_all_token = generate_choosed_experts(self.splits_cpu, self.ntokens, self.topk, device)
-            token_per_rank = batch_size * num_tokens // WORLD_SIZE # 10240/8=1280
-            # token_per_rank = 51200
-            self.choosed_experts = self.choosed_experts_all_token[self.ep_rank * token_per_rank : (self.ep_rank+1) * token_per_rank].to(torch.int32).cuda()
+            self.choosed_experts = self.choosed_experts_all_token[self.ep_rank * 1280 : (self.ep_rank+1) * 1280].to(torch.int32).cuda()
 
             self.gate_weight = torch.rand((self.ntokens, topk), dtype=input_dtype, device=device)
             gather_index, _ = moe_utils.calculate_gather_index_weight(
@@ -416,8 +388,8 @@ class MoeMlp1Ctx:
 
             torch.distributed.all_gather_into_tensor(self.inputs, self.inputs_shard, group=TP_GROUP)
             self.scatter_inputs.copy_(torch.index_select(self.inputs, dim=0, index=self.gather_index))
-            # self.dispatched_input = self.scatter_inputs[self.ep_rank * 12800 : self.ep_rank * 12800 + 12800]
-            # self.tokens_per_expert = torch.tensor([1600, 1600, 1600, 1600, 1600, 1600, 1600, 1600])
+            self.dispatched_input = self.scatter_inputs[self.ep_rank * 12800 : self.ep_rank * 12800 + 12800]
+            self.tokens_per_expert = torch.tensor([1600, 1600, 1600, 1600, 1600, 1600, 1600, 1600])
 
             # if torch.distributed.get_rank() == 1:
             #     print("self.dispatched_input: ", self.dispatched_input, self.dispatched_input.size())
@@ -441,7 +413,7 @@ def perf_torch(ctx: MoeMlp1Ctx):
     full_output = torch.zeros((51200, 5120), dtype=torch.bfloat16, device=input.device)
     for exp_id in range(weight.size(0)):
         exp_w = weight[exp_id]
-        Mi = ctx.splits_cpu[exp_id + TP_GROUP.rank() // args.tp_world_size * ctx.nexperts_ep]
+        Mi = ctx.splits_cpu[exp_id + TP_GROUP.rank() // 2 * 8]
         exp_input = input[acc : acc + Mi]
         acc += Mi
         output_list.append(torch.matmul(exp_input, exp_w.t()))
@@ -463,10 +435,11 @@ def perf_torch(ctx: MoeMlp1Ctx):
     )
     torch.distributed.reduce_scatter_tensor(output2, topk_reduce, group=TP_GROUP)
 
-    # if RANK == 0:
-    #     print("perf_torch output: ", output2, output2.size())
+    if RANK == 0:
+        print("perf_torch output: ", output2, output2.size())
 
     return output2
+
 
 def perf_flux(ctx: MoeMlp1Ctx):
 
@@ -474,7 +447,7 @@ def perf_flux(ctx: MoeMlp1Ctx):
     weight = ctx._weight
 
     op = flux.GemmGroupedV3GatherRS(
-        32, 2*5120*5, 5120, 5, RANK, 8, args.tp_world_size, args.ep_world_size, 1
+        32, 2*5120*5, 5120, 5, RANK, 8, 2, 4, 1
     )
 
     output = op.forward_gather_rs(
@@ -488,8 +461,8 @@ def perf_flux(ctx: MoeMlp1Ctx):
         False,
     )
 
-    # if RANK == 0:
-    #     print("perf_flux output: ", output, output.size())
+    if RANK == 0:
+        print("perf_flux output: ", output, output.size())
 
     return output
 
@@ -511,6 +484,7 @@ class MoE_layer_megatron(torch.nn.Module):
         result, _ = self._moe_layer(input)
         return result
 
+
 class MoE_layer_megatron_wo_gate(torch.nn.Module):
     def __init__(self, config, ctx):
         super().__init__()
@@ -531,7 +505,7 @@ class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
 
         self.ctx = ctx
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=args.num_moe_experts, moe_grouped_gemm=True)
+            num_experts=args.num_moe_experts, moe_grouped_gemm=False)
         self._moe_layer = MoELayer_wo_gate_v2(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
 
         for name, param in self._moe_layer.named_parameters():
@@ -543,9 +517,9 @@ class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
                 param.data = self.ctx._weight[int(name[-1])]
 
     def forward(self):
-        reshaped_tensor = self.ctx.inputs_shard.reshape(num_tokens // WORLD_SIZE, batch_size, args.hidden_size)
+        reshaped_tensor = self.ctx.inputs_shard.reshape(640, 2, 5120)
         # self.ctx.choosed_experts_all_token = self.ctx.choosed_experts_all_token.cuda()
-        result, gelu_output = self._moe_layer(self.ctx.gate_weight, self.ctx.choosed_experts, reshaped_tensor)
+        result = self._moe_layer(self.ctx.gate_weight, self.ctx.choosed_experts, reshaped_tensor)
 
         full_output = torch.zeros((51200, 5120), dtype=result.dtype, device=self.ctx.inputs_shard.device)
         output1 = torch.zeros_like(full_output)
@@ -561,7 +535,7 @@ class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
 
         torch.distributed.reduce_scatter_tensor(output2, topk_reduce, group=TP_GROUP)
 
-        return output2, gelu_output
+        return output2
 
 
 class MoE_layer_flux(torch.nn.Module):
@@ -605,7 +579,7 @@ class MoE_layer_flux(torch.nn.Module):
                                                 args.tp_world_size, args.ep_world_size, 1)
 
 
-    def forward(self):
+    def forward(self, hidden_states):
 
         # if RANK == 0:
         #     print("probs: ", probs.size())
@@ -643,28 +617,34 @@ class MoE_layer_flux(torch.nn.Module):
             False,
         )
 
-        return mlp_output, self.ctx.gelu_output
+        return mlp_output
 
-def count_unequal_elements(tensor1, tensor2, tolerance):
-    diff = torch.abs((tensor1 - tensor2)/tensor1)
-    unequal_mask = diff > tolerance
-    count = torch.sum(unequal_mask)
-    return count
 
-def calculate_average_relative_error(tensor1, tensor2):
-    zero_mask = tensor1 == 0
-    relative_error = torch.zeros_like(tensor1)
-    relative_error[~zero_mask] = torch.abs((tensor1[~zero_mask] - tensor2[~zero_mask]) / tensor1[~zero_mask])
-    average_relative_error = torch.mean(relative_error)
-    return average_relative_error
 
 if __name__ == "__main__":
+
+    x = torch.tensor(torch.zeros([batch_size, num_tokens, model_dim], dtype=torch.float32, device='cpu').detach(
+    ).numpy(), dtype=torch.bfloat16, requires_grad=False, device=device)
+    ct = model_dim // num_local_experts
+    tmp_cnt = num_tokens // (num_local_experts * DIST_ENV.get_world().size() // args.topk)
+    # print(ct, tmp_cnt, num_tokens)
+    # construct special input
+    for j in range(num_tokens):
+
+        if args.topk == 1:
+            x[:, j, ct * (j % num_local_experts):ct * (j % num_local_experts + 1)] = (j %
+                                                                                    num_local_experts + 1) / 2
+        elif args.topk == num_local_experts * DIST_ENV.get_world().size():
+            x[:, j, :] = 0.1
+        else:
+            t_idx = j // tmp_cnt
+            x[:, j, ct * (t_idx * args.topk):ct * ((t_idx + 1) * args.topk)] = (t_idx + 1) / 5
 
     transformer_config = TransformerConfig(
         num_layers=2,
         hidden_size=args.hidden_size,
         ffn_hidden_size=args.hidden_size,
-        num_attention_heads=8,
+        num_attention_heads=4,
         num_moe_experts=args.num_moe_experts,
         use_cpu_initialization=True,
         activation_func=torch.nn.functional.gelu,
@@ -672,11 +652,11 @@ if __name__ == "__main__":
         bias_activation_fusion=False,
         moe_router_load_balancing_type="none",
         moe_router_topk=args.topk,
-        moe_grouped_gemm=True,
+        moe_grouped_gemm=False,
         moe_extended_tp=False,
         add_bias_linear=False,
-        tensor_model_parallel_size=args.tp_world_size,
-        expert_model_parallel_size=args.ep_world_size,
+        tensor_model_parallel_size=2,
+        expert_model_parallel_size=4,
         sequence_parallel=True,
         tp_comm_overlap=True,
     )
@@ -701,11 +681,10 @@ if __name__ == "__main__":
     )
 
     flux_moe = MoE_layer_flux(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    output1, flux_gelu_output = flux_moe()
-    # for i in range(5):
-    #     output1, flux_gelu_output = flux_moe()
-    o1 = perf_flux(moe_ctx)
-    o2 = perf_torch(moe_ctx)
+    for i in range(5):
+        output1 = flux_moe(x)
+    # perf_flux(moe_ctx)
+    # perf_torch(moe_ctx)
 
 
     start_event = torch.cuda.Event(enable_timing=True)
@@ -715,44 +694,39 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
 
     start_event.record()
-    iters = 1
+    iters = 100
     for i in range(iters):
         torch.distributed.barrier()
-        output1, flux_gelu_output = flux_moe()
+        output1 = flux_moe(x)
 
     end_event.record()
     end_event.synchronize()
 
     elapsed_time = start_event.elapsed_time(end_event)
-    print_rank_0("Flux time: {}".format(elapsed_time / iters))
+    if RANK == 0:
+        # print("moe_ctx.outputs shape:", moe_ctx.outputs[0].size())
+        # print(moe_ctx.outputs[0])
+        print("Flux time: ", elapsed_time / iters)
 
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=args.tp_world_size, expert_model_parallel_size=args.ep_world_size)
-    # initialize_tp_communicators()
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=4)
+    # megatron_moe = MoE_layer_megatron_wo_gate(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
+    # print("choosed_experts: ", moe_ctx.choosed_experts, moe_ctx.choosed_experts.size())
+    # print("gate_weight: ", moe_ctx.gate_weight, moe_ctx.gate_weight.size())
     megatron_moe = MoE_layer_megatron_wo_gate_v2(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    # for i in range(5):
-    #     output2, megatron_gelu_output = megatron_moe()
+    # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
+    output2 = megatron_moe()
 
     start_event.record()
     for i in range(iters):
         torch.distributed.barrier()
-        output2, megatron_gelu_output = megatron_moe()
+        output2 = megatron_moe()
 
     end_event.record()
     end_event.synchronize()
     elapsed_time = start_event.elapsed_time(end_event)
 
     # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
-    print_rank_0("Megatron time: {}".format(elapsed_time / iters))
-    if RANK == 2:
+    if RANK == 0:
+        print("Megatron time: ", elapsed_time / iters)
         # print("Flux output shape: ", output1.size(), output1)
         # print("Megatron output shape: ", output2.size(), output2)
-
-        print(count_unequal_elements(flux_gelu_output, megatron_gelu_output, 0.1))
-        print(calculate_average_relative_error(flux_gelu_output, megatron_gelu_output))
-        print(torch.sum(flux_gelu_output == 0))
-        print(torch.equal(flux_gelu_output, megatron_gelu_output))
-
-        print(count_unequal_elements(output1, output2, 0.1))
-        print(calculate_average_relative_error(output1, output2))
-        print(torch.sum(output1 == 0))
-        print(torch.equal(output1, output2))
