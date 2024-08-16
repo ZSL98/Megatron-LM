@@ -250,93 +250,15 @@ def one_forward_step(
                    'scheduler are built')
     config = get_model_config(model[0])
 
-    # Data stuff.
-    app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    timers('train/valid/test-data-iterators-setup', log_level=0).start(
-        barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
-        valid_data_iterator = []
-        test_data_iterator = []
-        for i in range(len(model)):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
-            iterators = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
-            train_data_iterator.append(iterators[0])
-            valid_data_iterator.append(iterators[1])
-            test_data_iterator.append(iterators[2])
-    else:
-        train_data_iterator, valid_data_iterator, test_data_iterator \
-            = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
-    timers('train/valid/test-data-iterators-setup').stop()
-    print_datetime('after dataloaders are built')
-    app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+    bs = 8
+    seq_len = 1024
 
+    tokens = torch.randn(bs, seq_len)
+    position_ids = torch.randn(bs, seq_len)
+    attention_mask = torch.ones(bs, seq_len)
+    labels = torch.randn(bs, seq_len)
 
-    # Context used for persisting some state between checkpoint saves.
-    checkpointing_context = {}
-
-    # Print setup timing.
-    print_rank_0('done with setup ...')
-    timers.log(['model-and-optimizer-setup',
-                'train/valid/test-data-iterators-setup'], barrier=True)
-
-    one_logger = get_one_logger()
-    one_logger and one_logger.log_metrics(app_metrics)
-
-    if not args.skip_train:
-        print_rank_0('training ...')
-
-        if args.dataloader_type == 'cyclic' and args.retro_project_dir:
-            assert args.retro_cyclic_train_iters is not None
-            args.train_iters = args.retro_cyclic_train_iters
-            print_rank_0("retro cyclic train iters : %d" % args.train_iters)
-
-        iteration = 0
-        if args.do_train and args.train_iters > 0:
-            iteration, num_floating_point_operations_so_far = train(
-                forward_step_func,
-                model, optimizer, opt_param_scheduler,
-                train_data_iterator, valid_data_iterator,
-                process_non_loss_data_func, config, checkpointing_context)
-
-        print_datetime('after training is done')
-
-        if args.save and iteration != 0 and iteration % args.save_interval != 0:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                            num_floating_point_operations_so_far, checkpointing_context,
-                            train_data_iterator=train_data_iterator)
-
-        one_logger and one_logger.log_metrics({
-            'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
-        })
-
-    else:
-        print_rank_0('skipping training (--skip-train is on) ...')
-
-        iteration = args.iteration
-
-    if args.do_valid:
-        prefix = f'iteration {iteration} on validation set'
-        evaluate_and_print_results(prefix, forward_step_func,
-                                   valid_data_iterator, model,
-                                   iteration, process_non_loss_data_func, config,
-                                   verbose=True, write_to_tensorboard=not args.skip_train)
-
-    if args.do_test:
-        prefix = f'iteration {iteration} on test set'
-        evaluate_and_print_results(prefix, forward_step_func,
-                                   test_data_iterator, model,
-                                   iteration, process_non_loss_data_func, config,
-                                   verbose=True, write_to_tensorboard=not args.skip_train)
-
-    maybe_finalize_async_save(blocking=True)
-
-    one_logger and one_logger.log_metrics({
-        'app_finish_time': one_logger_utils.get_timestamp_in_ms()
-    })
-    one_logger_utils.finish()
+    forward_step_func(model, tokens, position_ids, attention_mask, labels)
 
 
 def update_train_iters(args):

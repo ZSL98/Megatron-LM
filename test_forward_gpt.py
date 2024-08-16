@@ -109,14 +109,9 @@ def get_batch(data_iterator):
     return batch.values()
 
 
-def forward_step(data_iterator, model: GPTModel):
+def forward_step(model: GPTModel, tokens, position_ids, attention_mask, labels):
     """Forward step.
-
-    Args:
-        data_iterator : Input data iterator
-        model (GPTModel): The GPT Model
     """
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
     output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
     return output_tensor
