@@ -9,10 +9,6 @@ import logging
 import math
 import os
 import sys
-from .log_handler import CustomHandler
-# Make default logging level INFO, but filter out all log messages not from MCore.
-logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
-from .theoretical_memory_usage import report_theoretical_memory
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -41,8 +37,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches)
 
-from .async_utils import maybe_finalize_async_save
-from .utils import (
+from megatron.training.utils import (
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
     is_last_rank,
@@ -52,14 +47,13 @@ from .utils import (
     unwrap_model,
     append_to_progress_log,
 )
-from .global_vars import (
+from megatron.training.global_vars import (
     get_args,
     get_signal_handler,
     get_timers,
     get_tensorboard_writer,
     get_wandb_writer,
     get_one_logger)
-from . import one_logger_utils
 
 
 stimer = StragglerDetector()
@@ -238,7 +232,6 @@ def one_forward_step(
     print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
-    app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
     args = get_args()
     timers = get_timers()
@@ -471,23 +464,6 @@ def setup_model_and_optimizer(model_provider_func,
                                        scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
-    if args.load is not None or args.pretrained_checkpoint is not None:
-        one_logger and one_logger.log_metrics({
-            'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()
-        })
-        timers('load-checkpoint', log_level=0).start(barrier=True)
-        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
-            model, optimizer, opt_param_scheduler)
-        timers('load-checkpoint').stop(barrier=True)
-        timers.log(['load-checkpoint'])
-        one_logger and one_logger.log_metrics({
-            'load_checkpoint_finish_time': one_logger_utils.get_timestamp_in_ms(),
-            'load_checkpoint_time': timers('load-checkpoint').active_time()
-        })
-    else:
-        args.iteration = 0
-        args.num_floating_point_operations_so_far = 0
-
     # get model without FP16 and/or DDP wrappers
     if args.iteration == 0 and len(unwrapped_model) == 1 \
         and hasattr(unwrapped_model[0], 'init_state_dict_from_bert'):
@@ -649,9 +625,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
     batch_size = args.micro_batch_size * args.data_parallel_size * \
         get_num_microbatches()
 
-    # Track app tag & app tag ID
-    one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
-
     total_iterations = total_loss_dict[advanced_iters_key] + \
                        total_loss_dict[skipped_iters_key]
 
@@ -745,8 +718,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
 
-        one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
-
         if args.log_timers_to_tensorboard:
             if writer:
                 writer.add_scalar('iteration-time',
@@ -806,9 +777,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         print_rank_last(log_string)
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
-            if torch.distributed.get_rank() == 0:
-                num_microbatches = get_num_microbatches()
-                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
@@ -850,46 +818,6 @@ def compute_throughputs_and_append_to_progress_log(iteration,
                            f"Tokens (in billions): {tokens_so_far / 10**9:.2f}")
 
 
-def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
-                             num_floating_point_operations_so_far, checkpointing_context,
-                             non_persistent_ckpt=False, train_data_iterator=None):
-    args = get_args()
-    timers = get_timers()
-
-    # Stop timer to get accurate train interval time and exclude checkpointing duration
-    timers('interval-time').stop()
-
-    # Extra barrier is added to make sure all ranks report the max time.
-    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
-    timers(timer_key, log_level=0).start(barrier=True)
-    save_checkpoint_start_time = timers('save-checkpoint').active_time()
-
-    # Log E2E metrics before save-checkpoint
-    one_logger_utils.track_e2e_metrics()
-
-    if args.use_distributed_optimizer and args.overlap_param_gather:
-        optimizer.disable_pre_hook()
-    save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                    num_floating_point_operations_so_far, checkpointing_context,
-                    non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator)
-    if args.use_distributed_optimizer and args.overlap_param_gather:
-        optimizer.enable_pre_hook()
-    timers(timer_key).stop(barrier=True)
-    timers.log([timer_key])
-    save_checkpoint_finish_time = timers('save-checkpoint').active_time()
-
-    # Log E2E metrics after save-checkpoint
-    one_logger_utils.track_e2e_metrics()
-    save_checkpoint_duration = save_checkpoint_finish_time - save_checkpoint_start_time
-    one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
-
-    if args.log_progress and not non_persistent_ckpt:
-        compute_throughputs_and_append_to_progress_log(iteration,
-                                                       num_floating_point_operations_so_far)
-
-    # Recover timing
-    timers('interval-time', log_level=0).start(barrier=True)
-
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
@@ -911,13 +839,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Iterations.
     iteration = args.iteration
-
-    # Track E2E metrics at the start of training
-    one_logger_utils.on_train_start(iteration=iteration, consumed_train_samples=args.consumed_train_samples,
-                                    train_samples=args.train_samples, seq_length=args.seq_length,
-                                    train_iters=args.train_iters, save=args.save, async_save=args.async_save,
-                                    log_throughput=args.log_throughput,
-                                    num_floating_point_operations_so_far=args.num_floating_point_operations_so_far)
 
     num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
 
@@ -996,8 +917,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
             torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
-
-        maybe_finalize_async_save(False)
 
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different
@@ -1192,8 +1111,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if args.use_distributed_optimizer and args.overlap_param_gather:
         optimizer.disable_pre_hook()
-
-    maybe_finalize_async_save(True)
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if exit:
