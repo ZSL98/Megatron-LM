@@ -466,7 +466,7 @@ class TEGroupedMLP(MegatronModule):
 
         output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
 
-        return output, intermediate_parallel # This should be output_bias!
+        return output, output_bias
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

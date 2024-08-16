@@ -203,8 +203,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             output_total: un-permuted updated hidden states output from all local experts
             with shape of [SeqLen/TP, MBS, HiddenSize]
         """
-        if torch.distributed.get_rank() == 0:
-            print("token_unpermutation hidden_states: ", hidden_states)
+        # if torch.distributed.get_rank() == 0:
+        #     print("token_unpermutation hidden_states: ", hidden_states)
+        
         # Stage1: unpermute the tokens and bias locally respectively.
         scores = self.local_probs.to(dtype=hidden_states.dtype)
         if self.num_local_experts > 1:
@@ -215,10 +216,8 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         # Scale the expert output prior to reduction and subsequent to local unpermutation if k > 1.
         if self.router_topk > 1:
-            unpermuted_local_hidden = unpermuted_local_hidden * scores.view(-1, 1)
-
-        if torch.distributed.get_rank() == 0:
-            print("unpermuted_local_hidden hidden_states: ", unpermuted_local_hidden)
+            # Note: this has been skipped
+            unpermuted_local_hidden_1 = unpermuted_local_hidden * scores.view(-1, 1)
 
         unpermuted_local_bias = None
         if self.add_bias:

@@ -44,7 +44,7 @@ class Router(ABC, MegatronModule):
 
         # Initialize the gate weights.
         self.weight = torch.nn.Parameter(
-            torch.empty((self.config.num_moe_experts, self.config.hidden_size))
+            torch.randn((self.config.num_moe_experts, self.config.hidden_size))
         )
         if config.perform_initialization:
             if get_cuda_rng_tracker().is_initialized():
@@ -306,6 +306,8 @@ class TopKRouter(Router):
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
+        # print("input: ", input)
+        # print("weight: ", self.weight)
         logits = logits.view(-1, self.config.num_moe_experts)
 
         scores, indices = self.routing(logits)
