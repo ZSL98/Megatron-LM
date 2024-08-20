@@ -219,17 +219,32 @@ def one_forward_step(
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
     # config = get_model_config(model[0])
-    print(forward_step_func)
 
-    bs = 8
-    seq_len = 1024
+    bs = 1
+    seq_len = 4096
 
     tokens = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
     position_ids = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
-    attention_mask = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
+    attention_mask = torch.ones(bs, 8, seq_len, seq_len, dtype=bool).cuda()
     labels = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
 
-    forward_step_func(model, tokens, position_ids, attention_mask, labels)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
+
+    start_event.record()
+    iters = 100
+    for i in range(iters):
+        torch.distributed.barrier()
+        forward_step_func(model, tokens, position_ids, attention_mask, labels)
+
+    end_event.record()
+    end_event.synchronize()
+
+    elapsed_time = start_event.elapsed_time(end_event)
+    print_rank_0("Forward time: {}".format(elapsed_time / iters))
 
 
 def update_train_iters(args):

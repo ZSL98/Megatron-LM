@@ -106,16 +106,16 @@ class MoELayer(BaseMoELayer):
 
         # process MoE
         def custom_forward(hidden_states):
-            print("hidden_states: ", hidden_states.size())
+            # print("hidden_states: ", hidden_states.size())
             probs, indices = self.router(hidden_states)
-            print("indices: ", indices.size())
+            # print("indices: ", indices.size())
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
                 hidden_states, probs, indices
             )
             print("dispatched_input: ", dispatched_input.size())
-            print("tokens_per_expert: ", tokens_per_expert)
+            # print("tokens_per_expert: ", tokens_per_expert)
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
-            print("expert_output: ", expert_output.size())
+            # print("expert_output: ", expert_output.size())
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
             return output, mlp_bias
 
@@ -297,16 +297,16 @@ class MoELayer_uniform_distribution_mixtral(BaseMoELayer):
             )
         self.moe_layer_recompute = config.moe_layer_recompute
         device = torch.cuda.current_device()
-        self.fake_hidden_states = torch.rand((512, 8, 4096), dtype=torch.bfloat16, device=device)
+        self.fake_hidden_states = torch.rand((1024, 1, 4096), dtype=torch.bfloat16, device=device)
+        # self.splits_cpu = torch.tensor([2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], dtype=torch.int32, device=device)
         self.splits_cpu = torch.tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024], dtype=torch.int32, device=device)
         self.choosed_experts_all_token, _ = generate_scatter_index(
-                self.splits_cpu, 4096 * 1, config.moe_router_topk, device
+                self.splits_cpu, 2048, config.moe_router_topk, device
             )
         # print("choosed_experts_all_token: ", self.choosed_experts_all_token.size())
         self.ep_rank = parallel_state.get_expert_model_parallel_rank()
-        token_per_rank = 4096
-        self.indices = self.choosed_experts_all_token
-        # self.indices = self.choosed_experts_all_token[self.ep_rank * token_per_rank : (self.ep_rank+1) * token_per_rank].to(torch.int32).cuda()
+        token_per_rank = 1024
+        self.indices = self.choosed_experts_all_token[self.ep_rank * token_per_rank : (self.ep_rank+1) * token_per_rank].to(torch.int32).cuda()
         # print("self.indices: ", self.indices.size(), self.ep_rank)
 
 
@@ -324,9 +324,12 @@ class MoELayer_uniform_distribution_mixtral(BaseMoELayer):
         # process MoE
         def custom_forward():
             probs0, indices0 = self.router(self.fake_hidden_states)
+            print("self.fake_hidden_states: ", self.fake_hidden_states.size())
+            print("self.indices: ", self.indices.size())
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
-                self.fake_hidden_states, probs0, self.choosed_experts_all_token
+                self.fake_hidden_states, probs0, self.indices
             )
+            print("dispatched_input: ", dispatched_input.size())
             # print("tokens_per_expert: ", tokens_per_expert)
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
@@ -335,3 +338,19 @@ class MoELayer_uniform_distribution_mixtral(BaseMoELayer):
         output, mlp_bias = custom_forward()
 
         return output, mlp_bias
+
+
+class MoELayer_flux_uniform_distribution_mixtral(BaseMoELayer):
+    def __init__(
+        self, config: TransformerConfig, submodules: MLPSubmodules = None, layer_number: int = None
+    ):
+        self.submodules = submodules
+        super(MoELayer_flux_uniform_distribution_mixtral, self).__init__(config=config, layer_number=layer_number)
+        self.router = TopKRouter(config=self.config)
+        device = torch.cuda.current_device()
+        self.mlp_output = torch.rand((512, 1, 4096), dtype=torch.bfloat16, device=device)
+        self.mlp_bias = torch.rand((512, 1, 4096), dtype=torch.bfloat16, device=device)
+
+
+    def forward(self, hidden_states):
+        return self.mlp_output, self.mlp_bias
