@@ -24,9 +24,9 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
-from megatron.training.initialize import initialize_megatron
-from megatron.training.initialize import write_args_to_tensorboard
-from megatron.training.initialize import set_jit_fusion_options
+from .initialize import initialize_megatron
+from .initialize import write_args_to_tensorboard
+from .initialize import set_jit_fusion_options
 from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
@@ -162,7 +162,6 @@ def get_start_time_from_progress_log():
 def one_forward_step(
     model_provider,
     forward_step_func,
-    process_non_loss_data_func=None,
     extra_args_provider=None,
     args_defaults={},
     get_embedding_ranks=None,
@@ -214,42 +213,21 @@ def one_forward_step(
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
 
-    # Adjust the startup time so it reflects the largest value.
-    # This will be closer to what scheduler will see (outside of
-    # image ... launches.
-    global _TRAIN_START_TIME
-    start_time_tensor = torch.tensor([_TRAIN_START_TIME],
-                                     dtype=torch.double,
-                                     device='cuda')
-    torch.distributed.all_reduce(start_time_tensor,
-                                 op=torch.distributed.ReduceOp.MIN)
-    _TRAIN_START_TIME = start_time_tensor.item()
-
-    app_metrics = {}
-    app_metrics['app_start_time'] = round(_TRAIN_START_TIME * 1000.0)
-    app_metrics['app_model_init_start_time'] = round(_TRAIN_START_TIME * 1000.0)
-
-    print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
-        time.time() - _TRAIN_START_TIME))
-    print_datetime('after megatron is initialized')
-
-    args = get_args()
-    timers = get_timers()
-
-    model = model_provider()
+    model = model_provider().to(torch.bfloat16).cuda()
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
-    config = get_model_config(model[0])
+    # config = get_model_config(model[0])
+    print(forward_step_func)
 
     bs = 8
     seq_len = 1024
 
-    tokens = torch.randn(bs, seq_len)
-    position_ids = torch.randn(bs, seq_len)
-    attention_mask = torch.ones(bs, seq_len)
-    labels = torch.randn(bs, seq_len)
+    tokens = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
+    position_ids = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
+    attention_mask = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
+    labels = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
 
     forward_step_func(model, tokens, position_ids, attention_mask, labels)
 

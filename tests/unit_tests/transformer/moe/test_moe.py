@@ -332,6 +332,8 @@ class MoeMlp1Ctx:
                     self.nexperts_ep * self.ep_rank : self.nexperts_ep * (self.ep_rank + 1)
                 ]
             )
+            print("self.splits_cpu: ", self.splits_cpu)
+            print("self.ntokens: ", self.ntokens)
 
             self.choosed_experts_all_token, self.scatter_index = generate_scatter_index(
                 self.splits_cpu, self.ntokens, self.topk, device

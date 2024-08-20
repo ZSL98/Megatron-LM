@@ -78,7 +78,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         model = GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
+            vocab_size=20000,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -152,7 +152,6 @@ if __name__ == "__main__":
 
     one_forward_step(
         model_provider,
-        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
