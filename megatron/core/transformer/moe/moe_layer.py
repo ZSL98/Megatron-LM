@@ -3,6 +3,10 @@
 from abc import ABC, abstractmethod
 
 import torch
+import os
+import flux
+from flux import pynvshmem
+from flux import moe_utils
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -16,6 +20,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.test_forward.utils import generate_scatter_index
 
+import torch.distributed as dist
 
 class BaseMoELayer(MegatronModule, ABC):
     """Base class for a mixture of experts layer.
@@ -112,7 +117,7 @@ class MoELayer(BaseMoELayer):
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
                 hidden_states, probs, indices
             )
-            print("dispatched_input: ", dispatched_input.size())
+            # print("dispatched_input: ", dispatched_input.size())
             # print("tokens_per_expert: ", tokens_per_expert)
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
             # print("expert_output: ", expert_output.size())
@@ -240,10 +245,78 @@ class MoELayer_wo_gate_v2(BaseMoELayer):
         # process MoE
         def custom_forward(probs, indices, hidden_states):
             probs0, indices0 = self.router(hidden_states)
-            # if torch.distributed.get_rank() == 0:
-            #     print("probs size: ", probs0.size(), probs0)
-            #     print("indices size: ", indices.size(), indices)
-                # print("hidden_states size: ", hidden_states.size(), hidden_states)
+            if torch.distributed.get_rank() == 0:
+                print("probs size: ", probs0.size(), probs0)
+                print("indices size: ", indices0.size(), indices0)
+                print("hidden_states size: ", hidden_states.size(), hidden_states)
+            (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
+                hidden_states, probs0, indices
+            )
+            # tokens_per_expert = torch.tensor([3200, 3200, 3200, 3200, 3200, 3200, 3200, 3200])
+            if torch.distributed.get_rank() == 0:
+                print("dispatched_input: ", dispatched_input.size(), "; tokens_per_expert: ", tokens_per_expert, "; rank: ", torch.distributed.get_rank())
+                # print("dispatched_input: ", dispatched_input, dispatched_input.size())
+            expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
+            if torch.distributed.get_rank() == 0:
+                print("expert_output: ", expert_output.size())
+            # output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+            # print("outputoutput: ", output.size())
+            return expert_output, mlp_bias
+
+        output, mlp_bias = custom_forward(probs, indices, hidden_states)
+
+        return output, mlp_bias
+
+
+class MoELayer_wo_gate_v3(BaseMoELayer):
+    """Mixture of experts Layer **currently only supports no token dropping**.
+
+    Args:
+        BaseMoELayer (MegatronModule): Base class for MoE layers
+    """
+
+    def __init__(
+        self, config: TransformerConfig, submodules: MLPSubmodules = None, layer_number: int = None
+    ):
+        self.submodules = submodules
+        super(MoELayer_wo_gate_v3, self).__init__(config=config, layer_number=layer_number)
+        self.router = TopKRouter(config=self.config)
+        if self.config.moe_grouped_gemm:
+            if isinstance(self.submodules, MLPSubmodules):
+                self.experts = TEGroupedMLP(self.num_local_experts, self.config, self.submodules)
+            else:
+                self.experts = GroupedMLP(self.num_local_experts, self.config)
+        else:
+            assert isinstance(self.submodules, MLPSubmodules)
+            self.experts = SequentialMLP(self.num_local_experts, self.config, self.submodules)
+        if config.moe_token_dispatcher_type == "allgather":
+            self.token_dispatcher = MoEAllGatherTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices, config=self.config
+            )
+        elif config.moe_token_dispatcher_type == "alltoall":
+            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices, config=self.config
+            )
+        else:
+            raise ValueError(
+                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
+            )
+        self.moe_layer_recompute = config.moe_layer_recompute
+
+    def forward(self, probs, indices, hidden_states):
+        if (
+            self.training
+            and self.config.tensor_model_parallel_size > 1
+            and not self.config.sequence_parallel
+        ):
+            raise ValueError(
+                "During training, performance may degrade if MoE and tensor parallelism"
+                "are enabled without also enabling sequence parallelism."
+            )
+
+        # process MoE
+        def custom_forward(probs, indices, hidden_states):
+            probs0, indices0 = self.router(hidden_states)
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
                 hidden_states, probs0, indices
             )
@@ -252,7 +325,8 @@ class MoELayer_wo_gate_v2(BaseMoELayer):
             #     print("dispatched_input: ", dispatched_input.size(), "; tokens_per_expert: ", tokens_per_expert, "; rank: ", torch.distributed.get_rank())
                 # print("dispatched_input: ", dispatched_input, dispatched_input.size())
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
-            # print("expert_output: ", expert_output)
+            # if torch.distributed.get_rank() == 0:
+            #     print("expert_output: ", expert_output.size())
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
             # print("outputoutput: ", output.size())
             return output, mlp_bias
@@ -297,15 +371,15 @@ class MoELayer_uniform_distribution_mixtral(BaseMoELayer):
             )
         self.moe_layer_recompute = config.moe_layer_recompute
         device = torch.cuda.current_device()
-        self.fake_hidden_states = torch.rand((1024, 1, 4096), dtype=torch.bfloat16, device=device)
+        self.fake_hidden_states = torch.rand((2048, 1, 4096), dtype=torch.bfloat16, device=device)
         # self.splits_cpu = torch.tensor([2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], dtype=torch.int32, device=device)
         self.splits_cpu = torch.tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024], dtype=torch.int32, device=device)
         self.choosed_experts_all_token, _ = generate_scatter_index(
-                self.splits_cpu, 2048, config.moe_router_topk, device
+                self.splits_cpu, 8192, config.moe_router_topk, device
             )
         # print("choosed_experts_all_token: ", self.choosed_experts_all_token.size())
         self.ep_rank = parallel_state.get_expert_model_parallel_rank()
-        token_per_rank = 1024
+        token_per_rank = 2048
         self.indices = self.choosed_experts_all_token[self.ep_rank * token_per_rank : (self.ep_rank+1) * token_per_rank].to(torch.int32).cuda()
         # print("self.indices: ", self.indices.size(), self.ep_rank)
 
@@ -324,12 +398,12 @@ class MoELayer_uniform_distribution_mixtral(BaseMoELayer):
         # process MoE
         def custom_forward():
             probs0, indices0 = self.router(self.fake_hidden_states)
-            print("self.fake_hidden_states: ", self.fake_hidden_states.size())
-            print("self.indices: ", self.indices.size())
+            # print("self.fake_hidden_states: ", self.fake_hidden_states.size())
+            # print("self.indices: ", self.indices.size())
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
                 self.fake_hidden_states, probs0, self.indices
             )
-            print("dispatched_input: ", dispatched_input.size())
+            # print("dispatched_input: ", dispatched_input.size())
             # print("tokens_per_expert: ", tokens_per_expert)
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
@@ -348,9 +422,69 @@ class MoELayer_flux_uniform_distribution_mixtral(BaseMoELayer):
         super(MoELayer_flux_uniform_distribution_mixtral, self).__init__(config=config, layer_number=layer_number)
         self.router = TopKRouter(config=self.config)
         device = torch.cuda.current_device()
-        self.mlp_output = torch.rand((512, 1, 4096), dtype=torch.bfloat16, device=device)
-        self.mlp_bias = torch.rand((512, 1, 4096), dtype=torch.bfloat16, device=device)
+        self.mlp_output = torch.rand((2048, 1, 4096), dtype=torch.bfloat16, device=device)
+        self.mlp_bias = torch.rand((2048, 1, 4096), dtype=torch.bfloat16, device=device)
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        ep_group = parallel_state.get_expert_model_parallel_group()
+
+        tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
+        ep_world_size = parallel_state.get_expert_model_parallel_world_size()
+        # print("tp_world_size: ", parallel_state.get_tensor_model_parallel_world_size())
+        # print("ep_world_size: ", parallel_state.get_expert_model_parallel_world_size())
+        self.activation_func = self.config.activation_func
+
+        flux.init_flux_shm(tp_group)
+        tp_env = flux.DistEnvTPWithEP(tp_group=tp_group, nnodes=1, ep_group=ep_group)
+        print("after DistEnvTPWithEP")
+        flux_m_max = 1 * 4096 * 2
+        bf16_moe_args = flux.MoeArguments(
+            max_ntokens=flux_m_max // self.config.moe_router_topk,
+            hidden=self.config.hidden_size,
+            ffn_hidden=self.config.ffn_hidden_size,
+            nexperts=self.config.num_moe_experts,
+            topk=self.config.moe_router_topk,
+            input_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+        )
+        self.flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env, bf16_moe_args)
+        RANK = int(os.environ.get("RANK", 0))
+        self.flux_rs_op = flux.GemmGroupedV3GatherRS(self.config.num_moe_experts, flux_m_max, self.config.hidden_size, 
+                                                    self.config.moe_router_topk, RANK, 8, tp_world_size, ep_world_size, 1)
+
+        self.fake_hidden_states = torch.rand((2048, 1, 4096), dtype=torch.bfloat16, device=device)
+        self.weights = torch.rand((8//ep_world_size, self.config.ffn_hidden_size//tp_world_size, self.config.hidden_size), dtype=torch.bfloat16, device=device)
+        self.splits_cpu = torch.tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024], dtype=torch.int32, device=device)
+        self.choosed_experts_all_token, self.scatter_index = generate_scatter_index(
+                self.splits_cpu, 8192, config.moe_router_topk, device
+            )
+        self.scatter_index = self.scatter_index.to(torch.int32)
+        self.outputs = torch.zeros((4096 * 2 // ep_world_size, self.config.ffn_hidden_size//tp_world_size), dtype=torch.bfloat16, device=device)
+        self.weight2 = torch.rand((self.config.num_moe_experts // ep_world_size, self.config.hidden_size, self.config.hidden_size // tp_world_size), dtype=torch.bfloat16).cuda()
 
 
     def forward(self, hidden_states):
-        return self.mlp_output, self.mlp_bias
+
+        self.flux_ag_op.forward_multiple_weights(
+            inputs_shard=self.fake_hidden_states,
+            weights=self.weights,
+            splits_gpu=self.splits_cpu,
+            scatter_index=self.scatter_index,
+            output_scale=None,
+            outputs_buf=self.outputs,
+            fast_accum=False,
+        )
+
+        intermediate_output = self.activation_func(self.outputs)
+        mlp_output = self.flux_rs_op.forward_gather_rs(
+            intermediate_output,
+            self.weight2,
+            self.splits_cpu,
+            self.scatter_index.view(-1),
+            None,
+            None,
+            None,
+            False,
+        )
+
+        return mlp_output, self.mlp_bias

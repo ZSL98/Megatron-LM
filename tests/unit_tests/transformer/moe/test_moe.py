@@ -17,7 +17,7 @@ from megatron.training import print_rank_0
 from megatron.training.initialize import initialize_megatron
 from megatron.core import mpu, tensor_parallel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate, MoELayer_wo_gate_v2
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate, MoELayer_wo_gate_v2, MoELayer_wo_gate_v3
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -37,12 +37,12 @@ from megatron.core.parallel_state import (
 
 def timed__all_gather_base(tensor_list, tensor, group=None, async_op=False,
                             timer_name=None):
-    work = torch.distributed._all_gather_base(tensor_list, tensor, group, async_op)
+    work = torch.distributed.all_gather_into_tensor(tensor_list, tensor, group, async_op)
     return work
 
 def timed__reduce_scatter_base(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False,
                                 timer_name=None):
-    work = torch.distributed._reduce_scatter_base(output, input, op, group, async_op)
+    work = torch.distributed.reduce_scatter_tensor(output, input, op, group, async_op)
     return work
 
 def timed_broadcast(tensor, src, group=None, async_op=False, timer_name=None):
@@ -536,7 +536,7 @@ class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
             num_experts=args.num_moe_experts, moe_grouped_gemm=True)
         self._moe_layer = MoELayer_wo_gate_v2(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
 
-        self.reshaped_tensor = self.ctx.inputs_shard.reshape(num_tokens // WORLD_SIZE, batch_size, args.hidden_size)
+        # self.reshaped_tensor = self.ctx.inputs_shard.reshape(num_tokens // WORLD_SIZE, batch_size, args.hidden_size)
 
         for name, param in self._moe_layer.named_parameters():
             # print("name, param.size: ", name, " ", param.size())
@@ -549,25 +549,52 @@ class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
     def forward(self):
     
         # self.ctx.choosed_experts_all_token = self.ctx.choosed_experts_all_token.cuda()
-        result, mlp_bias = self._moe_layer(self.ctx.gate_weight, self.ctx.choosed_experts, self.reshaped_tensor)
+        result, mlp_bias = self._moe_layer(self.ctx.gate_weight, self.ctx.choosed_experts, self.ctx.inputs_shard)
 
         # output = result.reshape(-1, 5120)
 
-        # full_output = torch.zeros((51200, 5120), dtype=result.dtype, device=self.ctx.inputs_shard.device)
-        # output1 = torch.zeros_like(full_output)
-        # output1[self.ctx.new_index] = result
-        # full_output += output1
-        # topk_reduce = full_output.view((full_output.size(0) // args.topk, args.topk, full_output.size(1))).sum(1)
-        # output2 = torch.zeros(
-        #     (full_output.size(0) // TP_GROUP.size() // args.topk, full_output.size(1)),
-        #     dtype=topk_reduce.dtype,
-        #     device=torch.cuda.current_device(),
-        #     requires_grad=False,
-        # )
+        full_output = torch.zeros((51200, 5120), dtype=result.dtype, device=self.ctx.inputs_shard.device)
+        output1 = torch.zeros_like(full_output)
+        output1[self.ctx.new_index] = result
+        full_output += output1
+        topk_reduce = full_output.view((full_output.size(0) // args.topk, args.topk, full_output.size(1))).sum(1)
+        output2 = torch.zeros(
+            (full_output.size(0) // TP_GROUP.size() // args.topk, full_output.size(1)),
+            dtype=topk_reduce.dtype,
+            device=torch.cuda.current_device(),
+            requires_grad=False,
+        )
 
-        # torch.distributed.reduce_scatter_tensor(output2, topk_reduce, group=TP_GROUP)
+        torch.distributed.reduce_scatter_tensor(output2, topk_reduce, group=TP_GROUP)
 
-        return result, mlp_bias
+        return output2, mlp_bias
+
+
+class MoE_layer_megatron_wo_gate_v3(torch.nn.Module):
+    def __init__(self, config, ctx):
+        super().__init__()
+
+        self.ctx = ctx
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=args.num_moe_experts, moe_grouped_gemm=True)
+        self._moe_layer = MoELayer_wo_gate_v3(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
+
+        self.reshaped_tensor = self.ctx.inputs_shard.reshape(num_tokens // WORLD_SIZE, batch_size, args.hidden_size)
+
+        for name, param in self._moe_layer.named_parameters():
+            # print("name, param.size: ", name, " ", param.size())
+            if "experts.linear_fc1.weight" in name:
+                # print("param.size: ", param.size())
+                param.data = self.ctx.weights[0][int(name[-1])]
+            if "experts.linear_fc2.weight" in name:
+                param.data = self.ctx._weight[int(name[-1])]
+
+    def forward(self):
+    
+        result, mlp_bias = self._moe_layer(self.ctx.gate_weight, self.ctx.choosed_experts, self.reshaped_tensor)
+        output = result.reshape(-1, 5120)
+
+        return output, mlp_bias
 
 
 class MoE_layer_flux(torch.nn.Module):
@@ -685,7 +712,7 @@ if __name__ == "__main__":
         expert_model_parallel_size=args.ep_world_size,
         sequence_parallel=True,
         tp_comm_overlap=True,
-        moe_token_dispatcher_type="alltoall"
+        moe_token_dispatcher_type="allgather"
     )
 
 
@@ -709,8 +736,8 @@ if __name__ == "__main__":
 
     flux_moe = MoE_layer_flux(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
     output1, flux_gelu_output = flux_moe()
-    for i in range(5):
-        output1, flux_gelu_output = flux_moe()
+    # for i in range(5):
+    #     output1, flux_gelu_output = flux_moe()
     # o1 = perf_flux(moe_ctx)
     # o2 = perf_torch(moe_ctx)
 
@@ -722,7 +749,7 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
 
     start_event.record()
-    iters = 100
+    iters = 1
     for i in range(iters):
         torch.distributed.barrier()
         output1, flux_gelu_output = flux_moe()
@@ -735,9 +762,9 @@ if __name__ == "__main__":
 
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=args.tp_world_size, expert_model_parallel_size=args.ep_world_size)
     # initialize_tp_communicators()
-    megatron_moe = MoE_layer_megatron_wo_gate_v2(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    for i in range(5):
-        output2, mlp_bias = megatron_moe()
+    megatron_moe = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
+    # for i in range(5):
+    #     output2, mlp_bias = megatron_moe()
 
     start_event.record()
     for i in range(iters):
@@ -750,16 +777,16 @@ if __name__ == "__main__":
 
     # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
     print_rank_0("Megatron time: {}".format(elapsed_time / iters))
-    # if RANK == 2:
-    #     print("Flux output shape: ", output1.size(), output1)
-    #     print("Megatron output shape: ", output2.size(), output2)
+    if RANK == 2:
+        print("Flux output shape: ", output1.size(), output1)
+        print("Megatron output shape: ", output2.size(), output2)
 
         # print(count_unequal_elements(flux_gelu_output, megatron_gelu_output, 0.1))
         # print(calculate_average_relative_error(flux_gelu_output, megatron_gelu_output))
         # print(torch.sum(flux_gelu_output == 0))
         # print(torch.equal(flux_gelu_output, megatron_gelu_output))
 
-        # print(count_unequal_elements(output1, output2, 0.1))
-        # print(calculate_average_relative_error(output1, output2))
-        # print(torch.sum(output1 == 0))
-        # print(torch.equal(output1, output2))
+        print(count_unequal_elements(output1, output2, 0.1))
+        print(calculate_average_relative_error(output1, output2))
+        print(torch.sum(output1 == 0))
+        print(torch.equal(output1, output2))

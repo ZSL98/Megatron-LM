@@ -7,7 +7,7 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate_v2, MoELayer_uniform_distribution_mixtral
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate_v2, MoELayer_uniform_distribution_mixtral, MoELayer_flux_uniform_distribution_mixtral
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
@@ -132,7 +132,7 @@ def _get_mlp_module_spec(
         use_te_grouped_gemm = use_te and TEColumnParallelGroupedLinear is not None
 
         return ModuleSpec(
-            module=MoELayer_uniform_distribution_mixtral,
+            module=MoELayer_flux_uniform_distribution_mixtral,
             submodules=(
                 MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
                 if not moe_grouped_gemm or use_te_grouped_gemm

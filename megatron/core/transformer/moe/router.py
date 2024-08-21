@@ -306,7 +306,7 @@ class TopKRouter(Router):
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
-        # print("input: ", input)
+        # print("input: ", input.size())
         # print("weight: ", self.weight)
         logits = logits.view(-1, self.config.num_moe_experts)
 
