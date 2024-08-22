@@ -70,7 +70,7 @@ OUT_DTYPE_MAP = {
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--dist", type=str, default="uniform")
+parser.add_argument("--dist", type=str, default="random")
 parser.add_argument('--local_rank', type=int, default=-1)
 parser.add_argument('--world_size', type=int, default=8)
 parser.add_argument('--ep_world_size', type=int, default=4)
@@ -192,6 +192,11 @@ def generate_scatter_index(splits, num_tokens, topk, device):
         bin_size, bins = torch.topk(bin_counter, topk)
         choosed_experts[tid] = bins
         bin_counter[bins] -= 1
+
+    # rand_indices = torch.randperm(choosed_experts.size(0)//8)
+    # for i in range(8):
+    #     choosed_experts[i*1280:(i+1)*1280] = choosed_experts[i*1280:(i+1)*1280][rand_indices]
+
 
     # generate scatter index
     scatter_index = torch.zeros((num_tokens, topk), dtype=torch.int64)
@@ -332,8 +337,6 @@ class MoeMlp1Ctx:
                     self.nexperts_ep * self.ep_rank : self.nexperts_ep * (self.ep_rank + 1)
                 ]
             )
-            print("self.splits_cpu: ", self.splits_cpu)
-            print("self.ntokens: ", self.ntokens)
 
             self.choosed_experts_all_token, self.scatter_index = generate_scatter_index(
                 self.splits_cpu, self.ntokens, self.topk, device
@@ -382,8 +385,11 @@ class MoeMlp1Ctx:
                 print("choosed_experts_all_token:", self.choosed_experts_all_token, self.choosed_experts_all_token.size())
             # self.choosed_experts_all_token = generate_choosed_experts(self.splits_cpu, self.ntokens, self.topk, device)
             token_per_rank = batch_size * num_tokens // WORLD_SIZE # 10240/8=1280
+            # token_per_rank = batch_size * num_tokens // args.ep_world_size # 10240/4=2560
             # token_per_rank = 51200
-            self.choosed_experts = self.choosed_experts_all_token[self.ep_rank * token_per_rank : (self.ep_rank+1) * token_per_rank].to(torch.int32).cuda()
+            # self.choosed_experts = self.choosed_experts_all_token[self.ep_rank * token_per_rank : (self.ep_rank+1) * token_per_rank].to(torch.int32).cuda()
+            # self.choosed_experts = self.choosed_experts_all_token[0 : token_per_rank].to(torch.int32).cuda()
+            self.choosed_experts = self.choosed_experts_all_token[RANK * token_per_rank : (RANK+1) * token_per_rank].to(torch.int32).cuda()
 
             self.gate_weight = torch.rand((self.ntokens, topk), dtype=input_dtype, device=device)
             gather_index, _ = moe_utils.calculate_gather_index_weight(
@@ -465,8 +471,8 @@ def perf_torch(ctx: MoeMlp1Ctx):
     )
     torch.distributed.reduce_scatter_tensor(output2, topk_reduce, group=TP_GROUP)
 
-    # if RANK == 0:
-    #     print("perf_torch output: ", output2, output2.size())
+    if RANK == 0:
+        print("perf_torch output: ", output2, output2.size())
 
     return output2
 
@@ -490,8 +496,8 @@ def perf_flux(ctx: MoeMlp1Ctx):
         False,
     )
 
-    # if RANK == 0:
-    #     print("perf_flux output: ", output, output.size())
+    if RANK == 0:
+        print("perf_flux output: ", output, output.size())
 
     return output
 
@@ -663,8 +669,8 @@ class MoE_layer_flux(torch.nn.Module):
         #     print("_weight shape: ", self._weight.size())
         #     print("self.ctx.scatter_index: ", self.ctx.scatter_index.size())
 
-        # if RANK == 2:
-        #     print("Flux gelu_output: ", self.ctx.gelu_output.size(), self.ctx.gelu_output)
+        if RANK == 2:
+            print("Flux gelu_output: ", self.ctx.gelu_output.size(), self.ctx.gelu_output)
         mlp_output = self.flux_rs_op.forward_gather_rs(
             self.ctx.gelu_output,
             self.ctx._weight,
@@ -735,11 +741,11 @@ if __name__ == "__main__":
     )
 
     flux_moe = MoE_layer_flux(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    output1, flux_gelu_output = flux_moe()
+    # output1, flux_gelu_output = flux_moe()
     # for i in range(5):
     #     output1, flux_gelu_output = flux_moe()
-    # o1 = perf_flux(moe_ctx)
-    # o2 = perf_torch(moe_ctx)
+    o1 = perf_flux(moe_ctx)
+    o2 = perf_torch(moe_ctx)
 
 
     start_event = torch.cuda.Event(enable_timing=True)
@@ -777,9 +783,10 @@ if __name__ == "__main__":
 
     # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
     print_rank_0("Megatron time: {}".format(elapsed_time / iters))
-    if RANK == 2:
-        print("Flux output shape: ", output1.size(), output1)
-        print("Megatron output shape: ", output2.size(), output2)
+    if RANK == 2 or RANK == 3 or RANK == 7:
+        if RANK == 2:
+            print("Flux output shape: ", output1.size(), output1)
+            print("Megatron output shape: ", output2.size(), output2)
 
         # print(count_unequal_elements(flux_gelu_output, megatron_gelu_output, 0.1))
         # print(calculate_average_relative_error(flux_gelu_output, megatron_gelu_output))
