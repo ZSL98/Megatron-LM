@@ -63,6 +63,71 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
+# class MixtralFluxMoELayer(MegatronModule, ABC):
+#     """Base class for a mixture of experts layer.
+
+#     Args:
+#         config (TransformerConfig): Configuration object for the transformer model.
+#     """
+#     tp_group = parallel_state.get_tensor_model_parallel_group()
+#     ep_group = parallel_state.get_expert_model_parallel_group()
+
+#     tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
+#     ep_world_size = parallel_state.get_expert_model_parallel_world_size()
+
+#     # DIST_ENV = flux.get_dist_env()
+#     TP_GROUP = torch.distributed.group.WORLD
+#     flux.init_flux_shm(TP_GROUP)
+#     tp_env = flux.DistEnvTPWithEP(tp_group=TP_GROUP, nnodes=1, ep_group=ep_group)
+#     flux_m_max = 1 * 4096 * 2
+#     bf16_moe_args = flux.MoeArguments(
+#         max_ntokens=flux_m_max // 2,
+#         hidden=4096,
+#         ffn_hidden=14336,
+#         nexperts=8,
+#         topk=2,
+#         input_dtype=torch.bfloat16,
+#         output_dtype=torch.bfloat16,
+#     )
+#     flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env, bf16_moe_args)
+#     RANK = int(os.environ.get("RANK", 0))
+#     flux_rs_op = flux.GemmGroupedV3GatherRS(8, flux_m_max, 4096, 
+#                                                 2, RANK, 8, tp_world_size, ep_world_size, 1)
+
+#     def __init__(self, config: TransformerConfig, layer_number: int = None):
+#         super(BaseMoELayer, self).__init__(config)
+#         self.config = config
+#         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
+#         assert self.expert_parallel_size > 0, "Expected non-negative expert parallel size"
+
+#         if self.config.moe_extended_tp:
+#             self.num_local_experts = self.config.num_moe_experts
+#             local_expert_indices_offset = 0
+#         else:
+#             assert self.config.num_moe_experts % self.expert_parallel_size == 0
+#             self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
+#             local_expert_indices_offset = (
+#                 parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+#             )
+
+#         self.local_expert_indices = [
+#             local_expert_indices_offset + i for i in range(self.num_local_experts)
+#         ]
+#         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
+#         self.router = None
+#         self.experts = None
+#         self.token_dispatcher = None
+#         self.layer_number = layer_number
+
+#     @abstractmethod
+#     def forward(self, hidden_states):
+#         pass
+
+#     def set_layer_number(self, layer_number: int):
+#         self.layer_number = layer_number
+#         self.router.set_layer_number(layer_number)
+
+
 class MoELayer(BaseMoELayer):
     """Mixture of experts Layer **currently only supports no token dropping**.
 
@@ -325,9 +390,8 @@ class MoELayer_wo_gate_v3(BaseMoELayer):
                 hidden_states, probs0, indices
             )
             # tokens_per_expert = torch.tensor([3200, 3200, 3200, 3200, 3200, 3200, 3200, 3200])
-            if torch.distributed.get_rank() == 2:
-                print("dispatched_input: ", dispatched_input.size(), "; tokens_per_expert: ", tokens_per_expert, "; rank: ", torch.distributed.get_rank())
-                # print("dispatched_input: ", dispatched_input, dispatched_input.size())
+            # if torch.distributed.get_rank() == 2:
+            #     print("dispatched_input: ", dispatched_input.size(), "; tokens_per_expert: ", tokens_per_expert, "; rank: ", torch.distributed.get_rank())
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
             # if torch.distributed.get_rank() == 0:
             #     print("expert_output: ", expert_output.size())
@@ -375,16 +439,17 @@ class MoELayer_uniform_distribution_mixtral(BaseMoELayer):
             )
         self.moe_layer_recompute = config.moe_layer_recompute
         device = torch.cuda.current_device()
-        self.fake_hidden_states = torch.rand((2048, 1, 4096), dtype=torch.bfloat16, device=device)
+        self.fake_hidden_states = torch.rand((512, 1, 4096), dtype=torch.bfloat16, device=device)
         # self.splits_cpu = torch.tensor([2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], dtype=torch.int32, device=device)
         self.splits_cpu = torch.tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024], dtype=torch.int32, device=device)
         self.choosed_experts_all_token, _ = generate_scatter_index(
-                self.splits_cpu, 8192, config.moe_router_topk, device
+                self.splits_cpu, 4096, config.moe_router_topk, device
             )
         # print("choosed_experts_all_token: ", self.choosed_experts_all_token.size())
         self.ep_rank = parallel_state.get_expert_model_parallel_rank()
-        token_per_rank = 2048
-        self.indices = self.choosed_experts_all_token[self.ep_rank * token_per_rank : (self.ep_rank+1) * token_per_rank].to(torch.int32).cuda()
+        token_per_rank = 512
+        # self.indices = self.choosed_experts_all_token[self.ep_rank * token_per_rank : (self.ep_rank+1) * token_per_rank].to(torch.int32).cuda()
+        self.indices = self.choosed_experts_all_token[0 : token_per_rank].to(torch.int32).cuda()
         # print("self.indices: ", self.indices.size(), self.ep_rank)
 
 
@@ -419,6 +484,11 @@ class MoELayer_uniform_distribution_mixtral(BaseMoELayer):
 
 
 class MoELayer_flux_uniform_distribution_mixtral(BaseMoELayer):
+
+    _initialized = False
+    flux_ag_op = None
+    flux_rs_op = None
+                                                
     def __init__(
         self, config: TransformerConfig, submodules: MLPSubmodules = None, layer_number: int = None
     ):
@@ -426,17 +496,16 @@ class MoELayer_flux_uniform_distribution_mixtral(BaseMoELayer):
         super(MoELayer_flux_uniform_distribution_mixtral, self).__init__(config=config, layer_number=layer_number)
         self.router = TopKRouter(config=self.config)
         device = torch.cuda.current_device()
-        self.mlp_output = torch.rand((2048, 1, 4096), dtype=torch.bfloat16, device=device)
-        self.mlp_bias = torch.rand((2048, 1, 4096), dtype=torch.bfloat16, device=device)
+        # self.mlp_output = torch.rand((512, 1, 4096), dtype=torch.bfloat16, device=device)
+        # self.mlp_bias = torch.rand((512, 1, 4096), dtype=torch.bfloat16, device=device)
+
+        self.activation_func = self.config.activation_func
 
         tp_group = parallel_state.get_tensor_model_parallel_group()
         ep_group = parallel_state.get_expert_model_parallel_group()
 
         tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
         ep_world_size = parallel_state.get_expert_model_parallel_world_size()
-        # print("tp_world_size: ", parallel_state.get_tensor_model_parallel_world_size())
-        # print("ep_world_size: ", parallel_state.get_expert_model_parallel_world_size())
-        self.activation_func = self.config.activation_func
 
         # DIST_ENV = flux.get_dist_env()
         TP_GROUP = torch.distributed.group.WORLD
@@ -444,52 +513,59 @@ class MoELayer_flux_uniform_distribution_mixtral(BaseMoELayer):
         tp_env = flux.DistEnvTPWithEP(tp_group=TP_GROUP, nnodes=1, ep_group=ep_group)
         flux_m_max = 1 * 4096 * 2
         bf16_moe_args = flux.MoeArguments(
-            max_ntokens=flux_m_max // self.config.moe_router_topk,
-            hidden=self.config.hidden_size,
-            ffn_hidden=self.config.ffn_hidden_size,
-            nexperts=self.config.num_moe_experts,
-            topk=self.config.moe_router_topk,
+            max_ntokens=flux_m_max // 2,
+            hidden=4096,
+            ffn_hidden=14336,
+            nexperts=8,
+            topk=2,
             input_dtype=torch.bfloat16,
             output_dtype=torch.bfloat16,
         )
-        self.flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env, bf16_moe_args)
         RANK = int(os.environ.get("RANK", 0))
-        self.flux_rs_op = flux.GemmGroupedV3GatherRS(self.config.num_moe_experts, flux_m_max, self.config.hidden_size, 
-                                                    self.config.moe_router_topk, RANK, 8, tp_world_size, ep_world_size, 1)
 
-        self.fake_hidden_states = torch.rand((2048, 4096), dtype=torch.bfloat16, device=device)
-        self.weights = torch.rand((8//ep_world_size, self.config.ffn_hidden_size//tp_world_size, self.config.hidden_size), dtype=torch.bfloat16, device=device)
-        self.splits_cpu = torch.tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024], dtype=torch.int32, device=device)
-        self.choosed_experts_all_token, self.scatter_index = generate_scatter_index(
-                self.splits_cpu, 16384, config.moe_router_topk, device
-            )
-        self.scatter_index = self.scatter_index.to(torch.int32)
-        self.outputs = [torch.zeros((4096 * 2 // ep_world_size, self.config.ffn_hidden_size//tp_world_size), dtype=torch.bfloat16, device=device)]
-        self.weight2 = torch.rand((self.config.num_moe_experts // ep_world_size, self.config.hidden_size, self.config.hidden_size // tp_world_size), dtype=torch.bfloat16).cuda()
+        if not MoELayer_flux_uniform_distribution_mixtral._initialized:
+            MoELayer_flux_uniform_distribution_mixtral.flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env, bf16_moe_args)
+            MoELayer_flux_uniform_distribution_mixtral.flux_rs_op = flux.GemmGroupedV3GatherRS(8, flux_m_max, 4096, 
+                                                        2, RANK, 8, tp_world_size, ep_world_size, 1)
+            MoELayer_flux_uniform_distribution_mixtral._initialized = True
+
+            MoELayer_flux_uniform_distribution_mixtral.fake_hidden_states = torch.rand((512, 4096), dtype=torch.bfloat16, device=device)
+            MoELayer_flux_uniform_distribution_mixtral.weights = torch.rand((8//ep_world_size, self.config.ffn_hidden_size//tp_world_size, self.config.hidden_size), dtype=torch.bfloat16, device=device)
+            MoELayer_flux_uniform_distribution_mixtral.splits_gpu = torch.tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024], dtype=torch.int32, device=device)
+            MoELayer_flux_uniform_distribution_mixtral.splits_cpu = torch.tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024], dtype=torch.int32)
+            MoELayer_flux_uniform_distribution_mixtral.choosed_experts_all_token, MoELayer_flux_uniform_distribution_mixtral.scatter_index = generate_scatter_index(
+                    MoELayer_flux_uniform_distribution_mixtral.splits_cpu, 4096, config.moe_router_topk, device
+                )
+            MoELayer_flux_uniform_distribution_mixtral.scatter_index = MoELayer_flux_uniform_distribution_mixtral.scatter_index.to(torch.int32)
+            MoELayer_flux_uniform_distribution_mixtral.outputs = [torch.zeros((4096 * 2 // ep_world_size, self.config.ffn_hidden_size//tp_world_size), dtype=torch.bfloat16, device=device)]
+            MoELayer_flux_uniform_distribution_mixtral.weight2 = torch.rand((self.config.num_moe_experts // ep_world_size, self.config.hidden_size, self.config.ffn_hidden_size // tp_world_size), dtype=torch.bfloat16).cuda()
 
 
     def forward(self, hidden_states):
 
-        self.flux_ag_op.forward_multiple_weights(
-            inputs_shard=self.fake_hidden_states,
-            weights=[self.weights],
-            splits_gpu=self.splits_cpu,
-            scatter_index=self.scatter_index,
+        MoELayer_flux_uniform_distribution_mixtral.flux_ag_op.forward_multiple_weights(
+            inputs_shard=MoELayer_flux_uniform_distribution_mixtral.fake_hidden_states,
+            weights=[MoELayer_flux_uniform_distribution_mixtral.weights],
+            splits_gpu=MoELayer_flux_uniform_distribution_mixtral.splits_gpu,
+            scatter_index=MoELayer_flux_uniform_distribution_mixtral.scatter_index,
             output_scale=None,
-            outputs_buf=self.outputs,
+            outputs_buf=MoELayer_flux_uniform_distribution_mixtral.outputs,
             fast_accum=False,
         )
 
-        intermediate_output = self.activation_func(self.outputs[0])
-        mlp_output = self.flux_rs_op.forward_gather_rs(
+        intermediate_output = self.activation_func(MoELayer_flux_uniform_distribution_mixtral.outputs[0])
+        # print("intermediate_output: ", intermediate_output.size())
+        mlp_output = MoELayer_flux_uniform_distribution_mixtral.flux_rs_op.forward_gather_rs(
             intermediate_output,
-            self.weight2,
-            self.splits_cpu,
-            self.scatter_index.view(-1),
+            MoELayer_flux_uniform_distribution_mixtral.weight2,
+            MoELayer_flux_uniform_distribution_mixtral.splits_cpu,
+            MoELayer_flux_uniform_distribution_mixtral.scatter_index.view(-1),
             None,
             None,
             None,
             False,
         )
+        # print("mlp_output: ", mlp_output.size())
+        mlp_output = mlp_output.unsqueeze(1)
 
-        return mlp_output, self.mlp_bias
+        return mlp_output, mlp_output

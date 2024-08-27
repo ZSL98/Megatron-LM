@@ -461,8 +461,8 @@ class TEGroupedMLP(MegatronModule):
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
-        if torch.distributed.get_rank() == 2:
-            print("Megatron gelu_output: ", intermediate_parallel.size(), intermediate_parallel)
+        # if torch.distributed.get_rank() == 2:
+        #     print("Megatron gelu_output: ", intermediate_parallel.size(), intermediate_parallel)
 
         output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
 
