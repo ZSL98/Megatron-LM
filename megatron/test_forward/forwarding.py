@@ -221,7 +221,7 @@ def one_forward_step(
     # config = get_model_config(model[0])
 
     bs = 1
-    seq_len = 4096
+    seq_len = 6000
 
     tokens = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
     position_ids = torch.ones(bs, seq_len, dtype=torch.int64).cuda()

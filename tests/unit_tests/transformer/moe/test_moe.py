@@ -10,6 +10,7 @@ from contextlib import contextmanager, nullcontext
 import random
 from random import randint
 from torch.profiler import profile, record_function, ProfilerActivity
+import csv
 
 try:
     import lego_ops
@@ -584,13 +585,13 @@ class MoE_layer_megatron_wo_gate_v2(torch.nn.Module):
 
 
 class MoE_layer_megatron_wo_gate_v3(torch.nn.Module):
-    def __init__(self, config, ctx):
+    def __init__(self, config, ctx, use_te):
         super().__init__()
 
         self.ctx = ctx
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=args.num_moe_experts, moe_grouped_gemm=True)
-        self._moe_layer = MoELayer_wo_gate_v3(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
+        self._moe_layer = MoELayer_wo_gate_v3(config, submodules=transformer_layer_spec.submodules.mlp.submodules, use_te=use_te)
 
         self.reshaped_tensor = self.ctx.inputs_shard.reshape(num_tokens // WORLD_SIZE, batch_size, args.hidden_size)
 
@@ -814,8 +815,8 @@ if __name__ == "__main__":
     end_event.record()
     end_event.synchronize()
 
-    elapsed_time = start_event.elapsed_time(end_event)
-    print_rank_0("Flux time: {}".format(elapsed_time / iters))
+    elapsed_time_flux = start_event.elapsed_time(end_event) / iters
+    print_rank_0("Flux time: {}".format(elapsed_time_flux))
 
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=args.tp_world_size, expert_model_parallel_size=args.ep_world_size)
 
@@ -827,25 +828,48 @@ if __name__ == "__main__":
 
     end_event.record()
     end_event.synchronize()
-    elapsed_time = start_event.elapsed_time(end_event)
-    print_rank_0("FasterMoE time: {}".format(elapsed_time / iters))
+    elapsed_time_fastermoe = start_event.elapsed_time(end_event) / iters
+    print_rank_0("FasterMoE time: {}".format(elapsed_time_fastermoe))
 
-    # initialize_tp_communicators()
-    megatron_moe = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    # for i in range(5):
-    #     output2, mlp_bias = megatron_moe()
+    megatron_moe_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=True).cuda().to(torch.bfloat16)
 
     start_event.record()
     for i in range(iters):
-        # torch.distributed.barrier()
-        output2, mlp_bias = megatron_moe()
+        torch.distributed.barrier()
+        output2, mlp_bias = megatron_moe_te()
 
     end_event.record()
     end_event.synchronize()
-    elapsed_time = start_event.elapsed_time(end_event)
+    elapsed_time_megatron_te = start_event.elapsed_time(end_event) / iters
+    print_rank_0("Megatron_te time: {}".format(elapsed_time_megatron_te))
 
-    # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
-    print_rank_0("Megatron time: {}".format(elapsed_time / iters))
+
+    megatron_moe_wo_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=False).cuda().to(torch.bfloat16)
+
+    start_event.record()
+    for i in range(iters):
+        torch.distributed.barrier()
+        output2, mlp_bias = megatron_moe_wo_te()
+
+    end_event.record()
+    end_event.synchronize()
+    elapsed_time_megatron_wo_te = start_event.elapsed_time(end_event) / iters
+    print_rank_0("Megatron_wo_te time: {}".format(elapsed_time_megatron_wo_te))
+
+    if RANK == 0:
+        # Prepare the CSV file
+        csv_file = 'timing_results.csv'
+        file_exists = os.path.isfile(csv_file)
+
+        # Write to the CSV file
+        with open(csv_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            # Write header if file does not exist
+            if not file_exists:
+                writer.writerow(['num_tokens', 'expert_num', 'topk', 'flux_time', 'fastermoe_time', 'megatron_time_te', 'megatron_time_wo_te'])
+            # Write the data
+            writer.writerow([args.num_tokens, args.num_moe_experts, args.topk, elapsed_time_flux, elapsed_time_fastermoe, elapsed_time_megatron_te, elapsed_time_megatron_wo_te])
+
     if RANK == 2 or RANK == 3 or RANK == 7:
         if RANK == 2:
             print("Flux output shape: ", output1.size(), output1)
