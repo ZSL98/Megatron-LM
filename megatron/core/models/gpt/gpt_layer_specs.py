@@ -132,7 +132,7 @@ def _get_mlp_module_spec(
         use_te_grouped_gemm = use_te and TEColumnParallelGroupedLinear is not None
 
         return ModuleSpec(
-            module=MoELayer_flux_uniform_distribution_qwen2,
+            module=MoELayer_uniform_distribution_mixtral,
             submodules=(
                 MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
                 if not moe_grouped_gemm or use_te_grouped_gemm

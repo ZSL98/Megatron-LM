@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import time
+import torch.profiler
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
@@ -221,7 +222,7 @@ def one_forward_step(
     # config = get_model_config(model[0])
 
     bs = 1
-    seq_len = 6000
+    seq_len = 4096
 
     tokens = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
     position_ids = torch.ones(bs, seq_len, dtype=torch.int64).cuda()
@@ -234,17 +235,25 @@ def one_forward_step(
     torch.distributed.barrier()
     torch.cuda.synchronize()
 
-    start_event.record()
-    iters = 100
-    for i in range(iters):
-        torch.distributed.barrier()
+    warmup_iters = 50
+    for _ in range(warmup_iters):
         forward_step_func(model, tokens, position_ids, attention_mask, labels)
 
-    end_event.record()
-    end_event.synchronize()
+    RANK = int(os.environ.get("RANK", 0))
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        profile_memory=True
+    ) as prof:
+        start_event.record()
+        iters = 10
+        for _ in range(iters):
+            forward_step_func(model, tokens, position_ids, attention_mask, labels)
+        end_event.record()
+        end_event.synchronize()
 
-    elapsed_time = start_event.elapsed_time(end_event)
-    print_rank_0("Forward time: {}".format(elapsed_time / iters))
+        elapsed_time = start_event.elapsed_time(end_event)
+        print_rank_0("Forward time: {}".format(elapsed_time / iters))
+    prof.export_chrome_trace(f"trace_rank_megatron_uniform{RANK}.json")
 
 
 def update_train_iters(args):
