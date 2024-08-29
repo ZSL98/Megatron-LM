@@ -205,20 +205,20 @@ def one_forward_step(
         get_position_embedding_ranks=get_position_embedding_ranks
     )
 
-    args = get_args()
-    timers = get_timers()
+    # args = get_args()
+    # timers = get_timers()
 
-    if args.log_progress:
-        append_to_progress_log("Starting job")
+    # if args.log_progress:
+    #     append_to_progress_log("Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
 
     model = model_provider().to(torch.bfloat16).cuda()
 
-    timers('model-and-optimizer-setup').stop()
-    print_datetime('after model, optimizer, and learning rate '
-                   'scheduler are built')
+    # timers('model-and-optimizer-setup').stop()
+    # print_datetime('after model, optimizer, and learning rate '
+    #                'scheduler are built')
     # config = get_model_config(model[0])
 
     bs = 1
@@ -253,7 +253,7 @@ def one_forward_step(
 
         elapsed_time = start_event.elapsed_time(end_event)
         print_rank_0("Forward time: {}".format(elapsed_time / iters))
-    prof.export_chrome_trace(f"trace_rank_megatron_uniform{RANK}.json")
+    prof.export_chrome_trace(f"./traces/trace_rank_e2e_flux_uniform{RANK}.json")
 
 
 def update_train_iters(args):

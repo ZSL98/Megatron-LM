@@ -6,6 +6,7 @@ from typing import List, Union
 import flux
 from flux import pynvshmem
 from flux import moe_utils
+from fmoe import FMoETransformerMLP
 from contextlib import contextmanager, nullcontext
 import random
 from random import randint
@@ -31,6 +32,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
 )
+from megatron.test_forward.initialize import set_jit_fusion_options, initialize_megatron
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core import parallel_state
@@ -41,7 +43,16 @@ from megatron.core.parallel_state import (
     get_expert_model_parallel_group,
     get_expert_model_parallel_world_size
 )
+from megatron.training.global_vars import (
+    set_global_variables,
+    get_args,
+    get_signal_handler,
+    get_timers,
+    get_tensorboard_writer,
+    get_wandb_writer,
+    get_one_logger)
 
+from tutel.impls.moe_layer import MOELayer as tutel_moelayer
 
 def timed__all_gather_base(tensor_list, tensor, group=None, async_op=False,
                             timer_name=None):
@@ -84,13 +95,13 @@ parser.add_argument('--world_size', type=int, default=8)
 parser.add_argument('--ep_world_size', type=int, default=1)
 parser.add_argument('--tp_world_size', type=int, default=8)
 parser.add_argument('--batch_size', type=int, default=1)
-parser.add_argument('--num_tokens', type=int, default=10240)
+parser.add_argument('--num_tokens', type=int, default=4096)
 parser.add_argument('--model_dim', type=int, default=14336)
 parser.add_argument('--hidden_size', type=int, default=4096)
 # parser.add_argument('--num_local_experts', type=int, default=8) # equals to num_moe_experts//ep_world_size
-parser.add_argument('--num_moe_experts', type=int, default=32)
+parser.add_argument('--num_moe_experts', type=int, default=8)
 parser.add_argument('--dtype', type=str, default='bfloat16')
-parser.add_argument('--topk', type=int, default=5)
+parser.add_argument('--topk', type=int, default=2)
 parser.add_argument('--mode', type=str, default='single')
 parser.add_argument('--expert_shape', type=str, default='abc-abd')
 parser.add_argument("--weight_groups", default=1, type=int, help="num of weight groups")
@@ -100,7 +111,7 @@ args.expert_shape = args.expert_shape.replace('-', '->')
 
 RANK = int(os.environ.get("RANK", 0))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
-DIST_ENV = flux.get_dist_env()
+DIST_ENV = flux.get_dist_env(deterministic=False)
 TP_GROUP = DIST_ENV.get_world()
 EP_GROUP = None
 torch.cuda.set_device(DIST_ENV.LOCAL_RANK)
@@ -794,102 +805,175 @@ if __name__ == "__main__":
         weight_groups=args.weight_groups,
     )
 
-    flux_moe = MoE_layer_flux(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    # output1, flux_gelu_output = flux_moe()
-    # for i in range(5):
-    #     output1, flux_gelu_output = flux_moe()
     # o1 = perf_flux(moe_ctx)
     # o2 = perf_torch(moe_ctx)
 
+    # test_list = ['flux', 'tutel', 'fastermoe', 'megatron_te', 'megatron']
+    test_list = ['flux', 'tutel', 'fastermoe']
+    profile_list = ['fastermoe']
+    profile_ctx = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=True,
+        )
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-
     torch.distributed.barrier()
     torch.cuda.synchronize()
+    warmup_iters = 50
+    iters = 100
+    profile_iters = 10
 
-    start_event.record()
-    iters = 1
-    warmup_iters = 1
-    for i in range(iters):
-        torch.distributed.barrier()
+    #============================= FLUX =================================#
+    # Prepare for the moe layer
+    flux_moe = MoE_layer_flux(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
+    for i in range(warmup_iters):
         output1, flux_gelu_output = flux_moe()
 
-    end_event.record()
-    end_event.synchronize()
+    def test_flux(iters):
+        start_event.record()
+        for i in range(iters):
+            output1, flux_gelu_output = flux_moe()
+        end_event.record()
+        end_event.synchronize()
+        elapsed_time_flux = start_event.elapsed_time(end_event) / iters
+        print_rank_0("Flux time: {}".format(elapsed_time_flux))
 
-    elapsed_time_flux = start_event.elapsed_time(end_event) / iters
-    print_rank_0("Flux time: {}".format(elapsed_time_flux))
+    if 'flux' in test_list:
+        for i in range(warmup_iters):
+            output1, flux_gelu_output = flux_moe()
+        test_flux(iters)
+        if 'flux' in profile_list:
+            with profile_ctx:
+                test_flux(profile_iters)
+            profile_ctx.export_chrome_trace(f"./traces/single_test_flux_{RANK}.json")
+
+
+    #============================= TUTEL =================================#
+    # Prepare for the moe layer
+    tutel_moe_layer = tutel_moelayer(
+        gate_type={'type': 'top', 'k': 2},
+        model_dim=args.hidden_size,
+        experts={
+            'count_per_node': 8,
+            'type': 'ffn', 
+            'hidden_size_per_expert': args.model_dim, 
+            'activation_fn': lambda x: torch.nn.functional.silu(x)
+        },
+        scan_expert_func = lambda name, param: setattr(param, 'skip_allreduce', True),
+    )
+    input = torch.randn((512, 4096), dtype=torch.bfloat16, device=device)
+    tutel_moe_layer = tutel_moe_layer.cuda().to(torch.bfloat16)
+
+    def test_tutel(iters):
+        start_event.record()
+        for i in range(iters):
+            _ = tutel_moe_layer(input)
+        end_event.record()
+        end_event.synchronize()
+        elapsed_time_tutel = start_event.elapsed_time(end_event) / iters
+        print_rank_0("Tutel time: {}".format(elapsed_time_tutel))
+
+    if 'tutel' in test_list:
+        for i in range(warmup_iters):
+            _ = tutel_moe_layer(input)
+        test_tutel(iters)
+        if 'tutel' in profile_list:
+            with profile_ctx:
+                test_tutel(profile_iters)
+            profile_ctx.export_chrome_trace(f"./traces/single_test_tutel_{RANK}.json")
+
 
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=args.tp_world_size, expert_model_parallel_size=args.ep_world_size)
 
-    fastermoe = MoE_layer_fastermoe(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    start_event.record()
-    for i in range(iters):
-        torch.distributed.barrier()
-        fastermoe()
-    end_event.record()
-    end_event.synchronize()
-    elapsed_time_fastermoe = start_event.elapsed_time(end_event) / iters
-    print_rank_0("FasterMoE time: {}".format(elapsed_time_fastermoe))
 
-
-    # Megatron without TE
-    megatron_moe_wo_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=False).cuda().to(torch.bfloat16)
+    #============================= FASTERMOE =================================#
+    # Prepare for the moe layer
+    # fastermoe = MoE_layer_fastermoe(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
+    fastermoe = FMoETransformerMLP(num_expert=args.num_moe_experts, 
+                                   d_model=args.hidden_size, 
+                                   d_hidden=args.model_dim,
+                                   world_size=WORLD_SIZE,
+                                   top_k=args.topk)
+    fastermoe = fastermoe.cuda().to(torch.bfloat16)
     for i in range(warmup_iters):
-        output2, mlp_bias = megatron_moe_wo_te()
-    start_event.record()
-    for i in range(iters):
-        output2, mlp_bias = megatron_moe_wo_te()
-    end_event.record()
-    end_event.synchronize()
-    elapsed_time_megatron_wo_te = start_event.elapsed_time(end_event) / iters
-    print_rank_0("Megatron_wo_te time: {}".format(elapsed_time_megatron_wo_te))
+        _ = fastermoe(input)
 
-
-    # Megatron with TE
-    megatron_moe_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=True).cuda().to(torch.bfloat16)
-    for i in range(warmup_iters):
-        output2, mlp_bias = megatron_moe_te()
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        profile_memory=True
-    ) as prof:
+    def test_fastermoe(iters):
         start_event.record()
-        for i in range(10):
-            output2, mlp_bias = megatron_moe_te()
-            torch.cuda.synchronize()
+        for i in range(iters):
+            _ = fastermoe(input)
         end_event.record()
         end_event.synchronize()
-        elapsed_time_megatron_te = start_event.elapsed_time(end_event) / iters
-        print_rank_0("Megatron_te time: {}".format(elapsed_time_megatron_te))
-    # prof.export_chrome_trace(f"./traces/single_test_trace_rank_02_{RANK}.json")
+        elapsed_time_fastermoe = start_event.elapsed_time(end_event) / iters
+        print_rank_0("FasterMoE time: {}".format(elapsed_time_fastermoe))
 
-    if RANK == 0:
-        # Prepare the CSV file
-        csv_file = 'timing_results.csv'
-        file_exists = os.path.isfile(csv_file)
+    if 'fastermoe' in test_list:
+        for i in range(warmup_iters):
+            _ = fastermoe(input)
+        test_fastermoe(iters)
+        if 'fastermoe' in profile_list:
+            with profile_ctx:
+                test_fastermoe(profile_iters)
+            profile_ctx.export_chrome_trace(f"./traces/single_test_fastermoe_{RANK}.json")
 
-        # Write to the CSV file
-        with open(csv_file, mode='a', newline='') as file:
-            writer = csv.writer(file)
-            # Write header if file does not exist
-            if not file_exists:
-                writer.writerow(['num_tokens', 'expert_num', 'topk', 'flux_time', 'fastermoe_time', 'megatron_time_te', 'megatron_time_wo_te'])
-            # Write the data
-            writer.writerow([args.num_tokens, args.num_moe_experts, args.topk, elapsed_time_flux, elapsed_time_fastermoe, elapsed_time_megatron_te, elapsed_time_megatron_wo_te])
 
-    if RANK == 2 or RANK == 3 or RANK == 7:
-        if RANK == 2:
-            print("Flux output shape: ", output1.size(), output1)
-            print("Megatron output shape: ", output2.size(), output2)
+    # # Megatron without TE
+    # megatron_moe_wo_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=False).cuda().to(torch.bfloat16)
+    # for i in range(warmup_iters):
+    #     output2, mlp_bias = megatron_moe_wo_te()
+    # start_event.record()
+    # for i in range(iters):
+    #     output2, mlp_bias = megatron_moe_wo_te()
+    # end_event.record()
+    # end_event.synchronize()
+    # elapsed_time_megatron_wo_te = start_event.elapsed_time(end_event) / iters
+    # print_rank_0("Megatron_wo_te time: {}".format(elapsed_time_megatron_wo_te))
 
-        # print(count_unequal_elements(flux_gelu_output, megatron_gelu_output, 0.1))
-        # print(calculate_average_relative_error(flux_gelu_output, megatron_gelu_output))
-        # print(torch.sum(flux_gelu_output == 0))
-        # print(torch.equal(flux_gelu_output, megatron_gelu_output))
 
-        print(count_unequal_elements(output1, output2, 0.1))
-        print(calculate_average_relative_error(output1, output2))
-        print(torch.sum(output1 == 0))
-        print(torch.equal(output1, output2))
+    # # Megatron with TE
+    # megatron_moe_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=True).cuda().to(torch.bfloat16)
+    # for i in range(warmup_iters):
+    #     output2, mlp_bias = megatron_moe_te()
+    # with torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+    #     profile_memory=True
+    # ) as prof:
+    #     start_event.record()
+    #     for i in range(iters):
+    #         output2, mlp_bias = megatron_moe_te()
+    #         torch.cuda.synchronize()
+    #     end_event.record()
+    #     end_event.synchronize()
+    #     elapsed_time_megatron_te = start_event.elapsed_time(end_event) / iters
+    #     print_rank_0("Megatron_te time: {}".format(elapsed_time_megatron_te))
+    # # prof.export_chrome_trace(f"./traces/single_test_trace_rank_02_{RANK}.json")
+
+    # if RANK == 0:
+    #     # Prepare the CSV file
+    #     csv_file = 'timing_results.csv'
+    #     file_exists = os.path.isfile(csv_file)
+
+    #     # Write to the CSV file
+    #     with open(csv_file, mode='a', newline='') as file:
+    #         writer = csv.writer(file)
+    #         # Write header if file does not exist
+    #         if not file_exists:
+    #             writer.writerow(['num_tokens', 'expert_num', 'topk', 'flux_time', 'fastermoe_time', 'megatron_time_te', 'megatron_time_wo_te'])
+    #         # Write the data
+    #         writer.writerow([args.num_tokens, args.num_moe_experts, args.topk, elapsed_time_flux, elapsed_time_fastermoe, elapsed_time_megatron_te, elapsed_time_megatron_wo_te])
+
+    # if RANK == 2 or RANK == 3 or RANK == 7:
+    #     if RANK == 2:
+    #         print("Flux output shape: ", output1.size(), output1)
+    #         print("Megatron output shape: ", output2.size(), output2)
+
+    #     # print(count_unequal_elements(flux_gelu_output, megatron_gelu_output, 0.1))
+    #     # print(calculate_average_relative_error(flux_gelu_output, megatron_gelu_output))
+    #     # print(torch.sum(flux_gelu_output == 0))
+    #     # print(torch.equal(flux_gelu_output, megatron_gelu_output))
+
+    #     print(count_unequal_elements(output1, output2, 0.1))
+    #     print(calculate_average_relative_error(output1, output2))
+    #     print(torch.sum(output1 == 0))
+    #     print(torch.equal(output1, output2))

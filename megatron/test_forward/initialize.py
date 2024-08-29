@@ -79,35 +79,14 @@ def initialize_megatron(
             print("> setting random seeds to {} ...".format(args.seed))
         _set_random_seed(args.seed, args.data_parallel_random_init)
 
-    if skip_mpu_initialization:
-        return None
-
     args = get_args()
-    if args.lazy_mpu_init:
-        # TODO is this still a necessary option?
-        args.use_cpu_initialization = True
-        # delayed initialization of DDP-related stuff
-        # We only set basic DDP globals
-        mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
-        # and return function for external DDP manager
-        # to call when it has DDP initialized
-        mpu.set_tensor_model_parallel_rank(args.rank)
-        return finish_mpu_init
-    else:
-        # Megatron's MPU is the master. Complete initialization right away.
-        finish_mpu_init()
+    finish_mpu_init()
 
-        # Autoresume.
-        _init_autoresume()
+    # Autoresume.
+    _init_autoresume()
 
-        # Compile dependencies.
-        # _compile_dependencies()
-
-        if args.tp_comm_overlap:
-           _initialize_tp_communicators()
-
-        # No continuation function
-        return None
+    # No continuation function
+    return None
 
 
 def _compile_dependencies():
@@ -339,7 +318,7 @@ def set_jit_fusion_options():
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
 
-    _warmup_jit_function()
+    # _warmup_jit_function()
 
 
 def _warmup_jit_function():

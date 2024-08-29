@@ -80,24 +80,24 @@ def set_global_variables(args, build_tokenizer=True):
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
 
-    init_num_microbatches_calculator(
-        args.rank,
-        args.rampup_batch_size,
-        args.global_batch_size,
-        args.micro_batch_size,
-        args.data_parallel_size,
-        args.decrease_batch_size_if_needed,
-    )
+    # init_num_microbatches_calculator(
+    #     args.rank,
+    #     args.rampup_batch_size,
+    #     args.global_batch_size,
+    #     args.micro_batch_size,
+    #     args.data_parallel_size,
+    #     args.decrease_batch_size_if_needed,
+    # )
     if build_tokenizer:
         _ = _build_tokenizer(args)
-    _set_tensorboard_writer(args)
-    _set_wandb_writer(args)
-    _set_one_logger(args)
-    _set_adlr_autoresume(args)
-    _set_timers(args)
+    # _set_tensorboard_writer(args)
+    # _set_wandb_writer(args)
+    # _set_one_logger(args)
+    # _set_adlr_autoresume(args)
+    # _set_timers(args)
 
-    if args.exit_signal_handler:
-        _set_signal_handler()
+    # if args.exit_signal_handler:
+    #     _set_signal_handler()
 
 
 def set_args(args):

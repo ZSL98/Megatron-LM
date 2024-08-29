@@ -10,11 +10,15 @@ from contextlib import contextmanager, nullcontext
 import random
 from random import randint
 import time
+from datetime import timedelta
 
+import packaging
+import packaging.version
 import argparse
 
+from megatron.training.arguments import parse_args
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate, MoELayer_wo_gate_v2
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate, MoELayer_wo_gate_v2, MoELayer_wo_gate_v3
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -32,7 +36,10 @@ from megatron.core.parallel_state import (
 )
 
 from megatron.core.transformer.custom_layers.transformer_engine import TEColumnParallelGroupedLinear
-
+from megatron.test_forward.initialize import set_jit_fusion_options, initialize_megatron
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training.global_vars import set_global_variables
 
 def timed__all_gather_base(tensor_list, tensor, group=None, async_op=False,
                             timer_name=None):
@@ -66,51 +73,19 @@ OUT_DTYPE_MAP = {
     "float8": torch.bfloat16
 }
 
-
-parser = argparse.ArgumentParser()
-
-parser.add_argument("--dist", type=str, default="uniform")
-parser.add_argument('--local_rank', type=int, default=-1)
-parser.add_argument('--world_size', type=int, default=8)
-parser.add_argument('--ep_world_size', type=int, default=4)
-parser.add_argument('--tp_world_size', type=int, default=2)
-parser.add_argument('--batch_size', type=int, default=2)
-parser.add_argument('--num_tokens', type=int, default=5120)
-parser.add_argument('--model_dim', type=int, default=5120)
-parser.add_argument('--hidden_size', type=int, default=5120)
-parser.add_argument('--num_local_experts', type=int, default=8) # equals to num_moe_experts//ep_world_size
-parser.add_argument('--num_moe_experts', type=int, default=32)
-parser.add_argument('--dtype', type=str, default='bfloat16')
-parser.add_argument('--topk', type=int, default=5)
-parser.add_argument('--mode', type=str, default='single')
-parser.add_argument('--expert_shape', type=str, default='abc-abd')
-parser.add_argument("--weight_groups", default=1, type=int, help="num of weight groups")
-parser.add_argument("--fast_accum", default=False, action="store_true", help="fp8 use fast accum")
-args = parser.parse_args()
-args.expert_shape = args.expert_shape.replace('-', '->')
-
 RANK = int(os.environ.get("RANK", 0))
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
-DIST_ENV = flux.get_dist_env()
+DIST_ENV = flux.get_dist_env(deterministic=False)
 TP_GROUP = DIST_ENV.get_world()
 EP_GROUP = None
 torch.cuda.set_device(DIST_ENV.LOCAL_RANK)
-
-batch_size = args.batch_size
-num_tokens = args.num_tokens
-model_dim = args.model_dim
-hidden_size = args.hidden_size
-num_local_experts = args.num_local_experts
-top_value = args.topk
-device = torch.cuda.current_device()
-
 
 class MoE_layer_megatron(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
 
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=args.num_moe_experts, moe_grouped_gemm=True)
+            num_experts=args.num_experts, moe_grouped_gemm=True)
         self._moe_layer = MoELayer(config, transformer_layer_spec.submodules.mlp.submodules)
 
     def forward(self, input):
@@ -123,7 +98,7 @@ class MoE_layer_megatron_wo_gate(torch.nn.Module):
         super().__init__()
 
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=args.num_moe_experts, moe_grouped_gemm=True)
+            num_experts=args.num_experts, moe_grouped_gemm=True)
         # self._moe_layer = MoELayer(config, transformer_layer_spec.submodules.mlp.submodules)
         self._moe_layer = MoELayer_wo_gate(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
         # self._moe_layer = MoELayer_wo_gate_v2(config, submodules=transformer_layer_spec.submodules.mlp.submodules)
@@ -133,62 +108,104 @@ class MoE_layer_megatron_wo_gate(torch.nn.Module):
         return result
 
 
+class MoE_layer_megatron_wo_gate_v3(torch.nn.Module):
+    def __init__(self, config, use_te):
+        super().__init__()
+
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=args.num_experts, moe_grouped_gemm=True)
+        self._moe_layer = MoELayer_wo_gate_v3(config, submodules=transformer_layer_spec.submodules.mlp.submodules, use_te=use_te)
+
+
+    def forward(self):
+        result, mlp_bias = self._moe_layer(None, None, None)
+        output = result.reshape(-1, args.hidden_size)
+
+        return output, mlp_bias
+
+
 if __name__ == "__main__":
 
-    # x = torch.tensor(torch.zeros([batch_size, num_tokens, model_dim], dtype=torch.float32, device='cpu').detach(
-    # ).numpy(), dtype=torch.bfloat16, requires_grad=False, device=device)
-    # ct = model_dim // num_local_experts
-    # tmp_cnt = num_tokens // (num_local_experts * DIST_ENV.get_world().size() // args.topk)
-    # # print(ct, tmp_cnt, num_tokens)
-    # # construct special input
-    # for j in range(num_tokens):
+    # initialize_megatron(args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    # args = get_args()
 
-    #     if args.topk == 1:
-    #         x[:, j, ct * (j % num_local_experts):ct * (j % num_local_experts + 1)] = (j %
-    #                                                                                 num_local_experts + 1) / 2
-    #     elif args.topk == num_local_experts * DIST_ENV.get_world().size():
-    #         x[:, j, :] = 0.1
-    #     else:
-    #         t_idx = j // tmp_cnt
-    #         x[:, j, ct * (t_idx * args.topk):ct * ((t_idx + 1) * args.topk)] = (t_idx + 1) / 5
+    args = parse_args(None, False)
+    set_global_variables(args, False)
+    # if args.rank == 0:
+    #     print("> initializing torch distributed ...", flush=True)
+    # # Manually set the device ids.
+    # torch.cuda.set_device(args.local_rank)
+    # device_id = torch.device(f'cuda:{args.local_rank}')
 
+    # # Call the init process
+    # init_process_group_kwargs = {
+    #     'backend' : args.distributed_backend,
+    #     'world_size': args.world_size,
+    #     'rank': args.rank,
+    #     'timeout': timedelta(minutes=args.distributed_timeout_minutes),
+    # }
+    # if packaging.version.Version(torch.__version__) >= packaging.version.Version("2.3.0"):
+    #     init_process_group_kwargs['device_id'] = device_id
 
-    x = torch.tensor(torch.zeros([batch_size * num_tokens // args.ep_world_size, model_dim], dtype=torch.float32, device='cpu').detach(
-    ).numpy(), dtype=torch.bfloat16, requires_grad=False, device=device)
+    # torch.distributed.init_process_group(**init_process_group_kwargs)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=args.tensor_model_parallel_size, expert_model_parallel_size=args.expert_model_parallel_size)
+
+    batch_size = args.micro_batch_size
+    num_tokens = args.seq_length
+    model_dim = args.ffn_hidden_size
+    hidden_size = args.hidden_size
+    device = torch.cuda.current_device()
 
     transformer_config = TransformerConfig(
         num_layers=2,
         hidden_size=args.hidden_size,
-        num_attention_heads=4,
-        num_moe_experts=args.num_moe_experts,
+        ffn_hidden_size=args.ffn_hidden_size,
+        num_attention_heads=8,
+        num_moe_experts=args.num_experts,
         use_cpu_initialization=True,
         activation_func=torch.nn.functional.gelu,
         gated_linear_unit=False,
         bias_activation_fusion=False,
         moe_router_load_balancing_type="none",
-        moe_router_topk=args.topk,
+        moe_router_topk=args.moe_router_topk,
         moe_grouped_gemm=True,
         moe_extended_tp=False,
         add_bias_linear=False,
-        tensor_model_parallel_size=2,
-        expert_model_parallel_size=4,
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
+        expert_model_parallel_size=args.expert_model_parallel_size,
         sequence_parallel=True,
+        tp_comm_overlap=True,
+        moe_token_dispatcher_type="allgather"
     )
 
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=4)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
+
+    warmup_iters = 5
+    iters = 100
+    megatron_moe_te = MoE_layer_megatron_wo_gate_v3(transformer_config, use_te=True).cuda().to(torch.bfloat16)
+    for i in range(warmup_iters):
+        output2, mlp_bias = megatron_moe_te()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        profile_memory=True
+    ) as prof:
+        start_event.record()
+        for i in range(iters):
+            output2, mlp_bias = megatron_moe_te()
+            torch.cuda.synchronize()
+        end_event.record()
+        end_event.synchronize()
+        elapsed_time_megatron_te = start_event.elapsed_time(end_event) / iters
+        print_rank_0("Megatron_te time: {}".format(elapsed_time_megatron_te))
+
+    # parallel_state.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=4)
     # print(get_expert_model_parallel_world_size())
     # print(get_tensor_model_parallel_world_size())
 
-    dispatched_input = torch.rand((args.batch_size * args.num_tokens * args.topk // args.ep_world_size, args.model_dim), dtype=torch.bfloat16).cuda()
-    tokens_per_expert = torch.tensor([1600, 1600, 1600, 1600, 1600, 1600, 1600, 1600])
-
-    megatron_moe = MoE_layer_megatron(transformer_config).cuda().to(torch.bfloat16)
-    # megatron_moe = MoE_layer_megatron_wo_gate(transformer_config).cuda().to(torch.bfloat16)
-
-    if args.expert_shape in ['ab->ac']:
-        x = x.reshape(-1, args.model_dim)
-
-    output1 = megatron_moe(x)
     exit()
 
     for i in range(5):
