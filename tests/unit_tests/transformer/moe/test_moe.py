@@ -707,7 +707,7 @@ class MoE_layer_flux(torch.nn.Module):
         n_dim = args.hidden_size # Check this!
         self.flux_rs_op = flux.GemmGroupedV3GatherRS(args.num_moe_experts, flux_m_max, n_dim, args.topk, RANK, WORLD_SIZE, 
                                                 args.tp_world_size, args.ep_world_size, 1)
-
+        self.reshaped_tensor = self.ctx.inputs_shard.reshape(num_tokens // WORLD_SIZE, batch_size, args.hidden_size)
 
     def forward(self):
 
@@ -715,6 +715,7 @@ class MoE_layer_flux(torch.nn.Module):
         #     print("probs: ", probs.size())
         #     print("indices: ", indices.size())
 
+        probs0, indices0 = self.router(self.reshaped_tensor)
         self.flux_ag_op.forward_multiple_weights(
             inputs_shard=self.ctx.inputs_shard,
             weights=self.ctx.weights,
@@ -789,7 +790,7 @@ if __name__ == "__main__":
 
     flux.init_flux_shm(TP_GROUP)
     init_ep_group(args.ep_world_size)
-    # parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=args.tp_world_size, expert_model_parallel_size=args.ep_world_size)
 
     moe_ctx = MoeMlp1Ctx(
         b=args.batch_size,
@@ -809,8 +810,8 @@ if __name__ == "__main__":
     # o2 = perf_torch(moe_ctx)
 
     # test_list = ['flux', 'tutel', 'fastermoe', 'megatron_te', 'megatron']
-    test_list = ['flux', 'tutel', 'fastermoe']
-    profile_list = ['fastermoe']
+    test_list = ['flux', 'tutel']
+    profile_list = []
     profile_ctx = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             record_shapes=True,
@@ -821,7 +822,7 @@ if __name__ == "__main__":
     torch.distributed.barrier()
     torch.cuda.synchronize()
     warmup_iters = 50
-    iters = 100
+    iters = 10
     profile_iters = 10
 
     #============================= FLUX =================================#
@@ -855,7 +856,7 @@ if __name__ == "__main__":
         gate_type={'type': 'top', 'k': 2},
         model_dim=args.hidden_size,
         experts={
-            'count_per_node': 8,
+            'count_per_node': 1,
             'type': 'ffn', 
             'hidden_size_per_expert': args.model_dim, 
             'activation_fn': lambda x: torch.nn.functional.silu(x)
@@ -883,26 +884,23 @@ if __name__ == "__main__":
                 test_tutel(profile_iters)
             profile_ctx.export_chrome_trace(f"./traces/single_test_tutel_{RANK}.json")
 
-
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=args.tp_world_size, expert_model_parallel_size=args.ep_world_size)
-
-
     #============================= FASTERMOE =================================#
     # Prepare for the moe layer
     # fastermoe = MoE_layer_fastermoe(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
     fastermoe = FMoETransformerMLP(num_expert=args.num_moe_experts, 
                                    d_model=args.hidden_size, 
-                                   d_hidden=args.model_dim,
+                                   d_hidden=args.model_dim//8,
                                    world_size=WORLD_SIZE,
                                    top_k=args.topk)
     fastermoe = fastermoe.cuda().to(torch.bfloat16)
+    input2 = torch.randn((4096, 4096), dtype=torch.bfloat16, device=device)
     for i in range(warmup_iters):
-        _ = fastermoe(input)
+        _ = fastermoe(input2)
 
     def test_fastermoe(iters):
         start_event.record()
         for i in range(iters):
-            _ = fastermoe(input)
+            _ = fastermoe(input2)
         end_event.record()
         end_event.synchronize()
         elapsed_time_fastermoe = start_event.elapsed_time(end_event) / iters
@@ -910,7 +908,7 @@ if __name__ == "__main__":
 
     if 'fastermoe' in test_list:
         for i in range(warmup_iters):
-            _ = fastermoe(input)
+            _ = fastermoe(input2)
         test_fastermoe(iters)
         if 'fastermoe' in profile_list:
             with profile_ctx:

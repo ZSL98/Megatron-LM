@@ -11,6 +11,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # set default communication env vars
 export BYTED_TORCH_BYTECCL=O0
 export NCCL_IB_TIMEOUT=${NCCL_IB_TIMEOUT:=23}
+export NCCL_DEBUG="ERROR"
 
 nproc_per_node=${ARNOLD_WORKER_GPU:=$(nvidia-smi --list-gpus | wc -l)}
 nnodes=${ARNOLD_WORKER_NUM:=1}
