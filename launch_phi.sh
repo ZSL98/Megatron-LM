@@ -70,10 +70,10 @@ MODEL_ARGS=(
     --disable-bias-linear
     --seq-length 4096
     --max-position-embeddings 32768
-    --num-layers 24
-    --hidden-size 2048
-    --ffn-hidden-size 5632
-    --num-attention-heads 16
+    --num-layers 32
+    --hidden-size 4096
+    --ffn-hidden-size 6400
+    --num-attention-heads 32
     --init-method-std 0.01
     --attention-dropout 0.0
     --hidden-dropout 0.0
@@ -88,10 +88,10 @@ MODEL_ARGS=(
 )
 
 MOE_ARGS=(
-    --num-experts 64
+    --num-experts 16
     --expert-model-parallel-size 1
     --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is aux_loss.
-    --moe-router-topk 4
+    --moe-router-topk 2
     --moe-aux-loss-coeff 1e-2
     --moe-grouped-gemm
 )

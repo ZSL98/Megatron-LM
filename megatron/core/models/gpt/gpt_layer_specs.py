@@ -7,7 +7,25 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoELayer_wo_gate_v2, MoELayer_uniform_distribution_mixtral, MoELayer_flux_uniform_distribution_mixtral, MoELayer_uniform_distribution_qwen2, MoELayer_flux_uniform_distribution_qwen2
+from megatron.core.transformer.moe.moe_layer import (
+    MoELayer, 
+    MoELayer_wo_te,
+    MoELayer_wo_gate_v2, 
+    MoELayer_uniform_distribution_mixtral, 
+    MoELayer_uniform_distribution_qwen2, 
+
+    MoELayer_flux_uniform_distribution_mixtral,
+    MoELayer_flux_uniform_distribution_qwen2,
+    MoELayer_flux_uniform_distribution_phi,
+
+    MoELayer_tutel_mixtral,
+    MoELayer_tutel_qwen2,
+    MoELayer_tutel_phi,
+
+    MoELayer_fastermoe_mixtral,
+    MoELayer_fastermoe_qwen2,
+    MoELayer_fastermoe_phi,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
@@ -44,10 +62,10 @@ except ImportError:
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 def get_gpt_layer_with_transformer_engine_spec(
-    num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
+    num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False, moe_layer_type: str = 'default'
 ) -> ModuleSpec:
     mlp = _get_mlp_module_spec(
-        use_te=True, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
+        use_te=True, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm, moe_layer_type=moe_layer_type
     )
     return ModuleSpec(
         module=TransformerLayer,
@@ -75,10 +93,10 @@ def get_gpt_layer_with_transformer_engine_spec(
 
 # Use this spec for an implementation using only modules in megatron core
 def get_gpt_layer_local_spec(
-    num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
+    num_experts: int = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False, moe_layer_type: str = 'default'
 ) -> ModuleSpec:
     mlp = _get_mlp_module_spec(
-        use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
+        use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm, moe_layer_type=moe_layer_type
     )
     return ModuleSpec(
         module=TransformerLayer,
@@ -109,7 +127,7 @@ def get_gpt_layer_local_spec(
 
 # Helper function to get module spec for MLP/MoE
 def _get_mlp_module_spec(
-    use_te: bool = True, num_experts: int = None, moe_grouped_gemm: bool = False
+    use_te: bool = True, num_experts: int = None, moe_grouped_gemm: bool = False, moe_layer_type: str = 'default'
 ) -> ModuleSpec:
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
@@ -131,8 +149,38 @@ def _get_mlp_module_spec(
 
         use_te_grouped_gemm = use_te and TEColumnParallelGroupedLinear is not None
 
+        moe_module = MoELayer_wo_te
+        
+        # if moe_layer_type == 'te':
+        #     moe_module = MoELayer
+        # elif moe_layer_type == 'flux':
+        #     moe_module = MoELayer_flux_uniform_distribution_mixtral
+        # elif moe_layer_type == 'tutel':
+        #     moe_module = MoELayer_tutel_mixtral
+        # elif moe_layer_type == 'fastermoe':
+        #     moe_module = MoELayer_fastermoe_mixtral
+
+        # if moe_layer_type == 'te':
+        #     moe_module = MoELayer
+        # elif moe_layer_type == 'flux':
+        #     moe_module = MoELayer_flux_uniform_distribution_qwen2
+        # elif moe_layer_type == 'tutel':
+        #     moe_module = MoELayer_tutel_qwen2
+        # elif moe_layer_type == 'fastermoe':
+        #     moe_module = MoELayer_fastermoe_qwen2
+
+        if moe_layer_type == 'te':
+            moe_module = MoELayer
+        elif moe_layer_type == 'flux':
+            moe_module = MoELayer_flux_uniform_distribution_phi
+        elif moe_layer_type == 'tutel':
+            moe_module = MoELayer_tutel_phi
+        elif moe_layer_type == 'fastermoe':
+            moe_module = MoELayer_fastermoe_phi
+
+
         return ModuleSpec(
-            module=MoELayer_flux_uniform_distribution_mixtral,
+            module=moe_module,
             submodules=(
                 MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
                 if not moe_grouped_gemm or use_te_grouped_gemm

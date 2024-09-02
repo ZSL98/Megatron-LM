@@ -70,10 +70,11 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
+            moe_layer_type = 'default'
             if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm, moe_layer_type)
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm, moe_layer_type)
 
         model = GPTModel(
             config=config,

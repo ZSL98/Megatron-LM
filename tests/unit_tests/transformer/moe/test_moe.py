@@ -7,6 +7,7 @@ import flux
 from flux import pynvshmem
 from flux import moe_utils
 from fmoe import FMoETransformerMLP
+from tutel.impls.moe_layer import MOELayer as tutel_moelayer
 from contextlib import contextmanager, nullcontext
 import random
 from random import randint
@@ -52,7 +53,6 @@ from megatron.training.global_vars import (
     get_wandb_writer,
     get_one_logger)
 
-from tutel.impls.moe_layer import MOELayer as tutel_moelayer
 
 def timed__all_gather_base(tensor_list, tensor, group=None, async_op=False,
                             timer_name=None):
@@ -728,13 +728,6 @@ class MoE_layer_flux(torch.nn.Module):
 
         self.ctx.gelu_output = self.activation_func(self.ctx.outputs[0])
 
-        # weighted_gelu_output = torch.ops.FasterTransformer.GatedLinearUnit_forward_swiglu(
-        #     ctx.outputs[0], ctx.outputs[1], scattered_gate_weight
-        # )
-        #     print("_input shape: ", self._input.size())
-        #     print("_weight shape: ", self._weight.size())
-        #     print("self.ctx.scatter_index: ", self.ctx.scatter_index.size())
-
         # if RANK == 2:
         #     print("Flux gelu_output: ", self.ctx.gelu_output.size(), self.ctx.gelu_output)
         mlp_output = self.flux_rs_op.forward_gather_rs(
@@ -809,8 +802,8 @@ if __name__ == "__main__":
     # o1 = perf_flux(moe_ctx)
     # o2 = perf_torch(moe_ctx)
 
-    # test_list = ['flux', 'tutel', 'fastermoe', 'megatron_te', 'megatron']
-    test_list = ['flux', 'tutel']
+    test_list = ['flux', 'tutel', 'fastermoe', 'megatron_te', 'megatron']
+    # test_list = ['megatron_te']
     profile_list = []
     profile_ctx = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
@@ -822,8 +815,9 @@ if __name__ == "__main__":
     torch.distributed.barrier()
     torch.cuda.synchronize()
     warmup_iters = 50
-    iters = 10
+    iters = 100
     profile_iters = 10
+    record = dict()
 
     #============================= FLUX =================================#
     # Prepare for the moe layer
@@ -838,6 +832,7 @@ if __name__ == "__main__":
         end_event.record()
         end_event.synchronize()
         elapsed_time_flux = start_event.elapsed_time(end_event) / iters
+        record['flux'] = elapsed_time_flux
         print_rank_0("Flux time: {}".format(elapsed_time_flux))
 
     if 'flux' in test_list:
@@ -853,17 +848,17 @@ if __name__ == "__main__":
     #============================= TUTEL =================================#
     # Prepare for the moe layer
     tutel_moe_layer = tutel_moelayer(
-        gate_type={'type': 'top', 'k': 2},
+        gate_type={'type': 'top', 'k': args.topk},
         model_dim=args.hidden_size,
         experts={
-            'count_per_node': 1,
+            'count_per_node': args.num_moe_experts//args.world_size,
             'type': 'ffn', 
             'hidden_size_per_expert': args.model_dim, 
             'activation_fn': lambda x: torch.nn.functional.silu(x)
         },
         scan_expert_func = lambda name, param: setattr(param, 'skip_allreduce', True),
     )
-    input = torch.randn((512, 4096), dtype=torch.bfloat16, device=device)
+    input = torch.randn((args.num_tokens*args.batch_size//WORLD_SIZE, args.hidden_size), dtype=torch.bfloat16, device=device)
     tutel_moe_layer = tutel_moe_layer.cuda().to(torch.bfloat16)
 
     def test_tutel(iters):
@@ -873,6 +868,7 @@ if __name__ == "__main__":
         end_event.record()
         end_event.synchronize()
         elapsed_time_tutel = start_event.elapsed_time(end_event) / iters
+        record['tutel'] = elapsed_time_tutel
         print_rank_0("Tutel time: {}".format(elapsed_time_tutel))
 
     if 'tutel' in test_list:
@@ -887,13 +883,13 @@ if __name__ == "__main__":
     #============================= FASTERMOE =================================#
     # Prepare for the moe layer
     # fastermoe = MoE_layer_fastermoe(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    fastermoe = FMoETransformerMLP(num_expert=args.num_moe_experts, 
+    fastermoe = FMoETransformerMLP(num_expert=1, 
                                    d_model=args.hidden_size, 
-                                   d_hidden=args.model_dim//8,
+                                   d_hidden=args.model_dim,
                                    world_size=WORLD_SIZE,
                                    top_k=args.topk)
     fastermoe = fastermoe.cuda().to(torch.bfloat16)
-    input2 = torch.randn((4096, 4096), dtype=torch.bfloat16, device=device)
+    input2 = torch.randn((args.num_tokens*args.batch_size//WORLD_SIZE, args.hidden_size), dtype=torch.bfloat16, device=device)
     for i in range(warmup_iters):
         _ = fastermoe(input2)
 
@@ -904,6 +900,7 @@ if __name__ == "__main__":
         end_event.record()
         end_event.synchronize()
         elapsed_time_fastermoe = start_event.elapsed_time(end_event) / iters
+        record['fastermoe'] = elapsed_time_fastermoe
         print_rank_0("FasterMoE time: {}".format(elapsed_time_fastermoe))
 
     if 'fastermoe' in test_list:
@@ -916,50 +913,69 @@ if __name__ == "__main__":
             profile_ctx.export_chrome_trace(f"./traces/single_test_fastermoe_{RANK}.json")
 
 
-    # # Megatron without TE
-    # megatron_moe_wo_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=False).cuda().to(torch.bfloat16)
-    # for i in range(warmup_iters):
-    #     output2, mlp_bias = megatron_moe_wo_te()
-    # start_event.record()
-    # for i in range(iters):
-    #     output2, mlp_bias = megatron_moe_wo_te()
-    # end_event.record()
-    # end_event.synchronize()
-    # elapsed_time_megatron_wo_te = start_event.elapsed_time(end_event) / iters
-    # print_rank_0("Megatron_wo_te time: {}".format(elapsed_time_megatron_wo_te))
+    #============================= Megatron without TE =================================#
+    megatron_moe_wo_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=False).cuda().to(torch.bfloat16)
+    for i in range(warmup_iters):
+        output2, mlp_bias = megatron_moe_wo_te()
+
+    def test_megatron_wo_te(iters):
+        start_event.record()
+        for i in range(iters):
+            output2, mlp_bias = megatron_moe_wo_te()
+        end_event.record()
+        end_event.synchronize()
+        elapsed_time_megatron_wo_te = start_event.elapsed_time(end_event) / iters
+        record['megatron_wo_te'] = elapsed_time_megatron_wo_te
+        print_rank_0("Megatron_wo_te time: {}".format(elapsed_time_megatron_wo_te))
+
+    if 'megatron' in test_list:
+        for i in range(warmup_iters):
+            output2, mlp_bias = megatron_moe_wo_te()
+        test_megatron_wo_te(iters)
+        if 'megatron' in profile_list:
+            with profile_ctx:
+                test_megatron_wo_te(profile_iters)
+            profile_ctx.export_chrome_trace(f"./traces/single_test_megatron_wo_te_{RANK}.json")
 
 
-    # # Megatron with TE
-    # megatron_moe_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=True).cuda().to(torch.bfloat16)
-    # for i in range(warmup_iters):
-    #     output2, mlp_bias = megatron_moe_te()
-    # with torch.profiler.profile(
-    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-    #     profile_memory=True
-    # ) as prof:
-    #     start_event.record()
-    #     for i in range(iters):
-    #         output2, mlp_bias = megatron_moe_te()
-    #         torch.cuda.synchronize()
-    #     end_event.record()
-    #     end_event.synchronize()
-    #     elapsed_time_megatron_te = start_event.elapsed_time(end_event) / iters
-    #     print_rank_0("Megatron_te time: {}".format(elapsed_time_megatron_te))
-    # # prof.export_chrome_trace(f"./traces/single_test_trace_rank_02_{RANK}.json")
+    #============================= Megatron with TE =================================#
+    megatron_moe_te = MoE_layer_megatron_wo_gate_v3(transformer_config, moe_ctx, use_te=True).cuda().to(torch.bfloat16)
+    for i in range(warmup_iters):
+        output2, mlp_bias = megatron_moe_te()
+    
+    def test_megatron_te(iters):
+        start_event.record()
+        for i in range(iters):
+            output2, mlp_bias = megatron_moe_te()
+            torch.cuda.synchronize()
+        end_event.record()
+        end_event.synchronize()
+        elapsed_time_megatron_te = start_event.elapsed_time(end_event) / iters
+        record['megatron_te'] = elapsed_time_megatron_te
+        print_rank_0("Megatron_te time: {}".format(elapsed_time_megatron_te))
 
-    # if RANK == 0:
-    #     # Prepare the CSV file
-    #     csv_file = 'timing_results.csv'
-    #     file_exists = os.path.isfile(csv_file)
+    if 'megatron_te' in test_list:
+        for i in range(warmup_iters):
+            output2, mlp_bias = megatron_moe_te()
+        test_megatron_te(iters)
+        if 'megatron_te' in profile_list:
+            with profile_ctx:
+                test_megatron_te(profile_iters)
+            profile_ctx.export_chrome_trace(f"./traces/single_test_megatron_te_{RANK}.json")
 
-    #     # Write to the CSV file
-    #     with open(csv_file, mode='a', newline='') as file:
-    #         writer = csv.writer(file)
-    #         # Write header if file does not exist
-    #         if not file_exists:
-    #             writer.writerow(['num_tokens', 'expert_num', 'topk', 'flux_time', 'fastermoe_time', 'megatron_time_te', 'megatron_time_wo_te'])
-    #         # Write the data
-    #         writer.writerow([args.num_tokens, args.num_moe_experts, args.topk, elapsed_time_flux, elapsed_time_fastermoe, elapsed_time_megatron_te, elapsed_time_megatron_wo_te])
+    if RANK == 0 and len(test_list) == 5:
+        # Prepare the CSV file
+        csv_file = 'timing_results.csv'
+        file_exists = os.path.isfile(csv_file)
+
+        # Write to the CSV file
+        with open(csv_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            # Write header if file does not exist
+            if not file_exists:
+                writer.writerow(['num_tokens', 'expert_num', 'topk', 'flux_time', 'tutel_time', 'fastermoe_time', 'megatron_time_te', 'megatron_time_wo_te'])
+            # Write the data
+            writer.writerow([args.num_tokens, args.num_moe_experts, args.topk, record['flux'], record['tutel'], record['fastermoe'], record['megatron_te'], record['megatron_wo_te']])
 
     # if RANK == 2 or RANK == 3 or RANK == 7:
     #     if RANK == 2:

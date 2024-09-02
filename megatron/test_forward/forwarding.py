@@ -240,20 +240,22 @@ def one_forward_step(
         forward_step_func(model, tokens, position_ids, attention_mask, labels)
 
     RANK = int(os.environ.get("RANK", 0))
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        profile_memory=True
-    ) as prof:
-        start_event.record()
-        iters = 10
-        for _ in range(iters):
-            forward_step_func(model, tokens, position_ids, attention_mask, labels)
-        end_event.record()
-        end_event.synchronize()
+    # with torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+    #     profile_memory=True
+    # ) as prof:
 
-        elapsed_time = start_event.elapsed_time(end_event)
-        print_rank_0("Forward time: {}".format(elapsed_time / iters))
-    prof.export_chrome_trace(f"./traces/trace_rank_e2e_flux_uniform{RANK}.json")
+    start_event.record()
+    iters = 100
+    for _ in range(iters):
+        forward_step_func(model, tokens, position_ids, attention_mask, labels)
+    end_event.record()
+    end_event.synchronize()
+
+    elapsed_time = start_event.elapsed_time(end_event)
+    print_rank_0("Forward time: {}".format(elapsed_time / iters))
+
+    # prof.export_chrome_trace(f"./traces/trace_rank_e2e_flux_uniform_{RANK}.json")
 
 
 def update_train_iters(args):
