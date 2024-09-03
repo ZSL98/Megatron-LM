@@ -48,6 +48,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_one_logger_args(parser)
+    parser = _add_diy_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -874,6 +875,14 @@ def _add_one_logger_args(parser):
                        'part of. It will be used to track the changes in the '
                        'application side which might change the performance '
                        'baseline')
+    return parser
+
+def _add_diy_args(parser):
+    group = parser.add_argument_group(title='diy')
+    group.add_argument('--moe-layer-type', type=str, default='default',
+                       help='moe layer type')
+    group.add_argument('--model-name', type=str, default='vanilla',
+                       help='model name')
     return parser
 
 def _add_logging_args(parser):

@@ -143,6 +143,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             global_local_map = global_local_mask.nonzero()[:, 0]
             self.global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
             local_hidden_states = moe_gather.apply(global_hidden_states, self.global_local_map)
+            # print("local_hidden_states{}:{}".format(local_hidden_states.size(), torch.distributed.get_rank()))
         else:
             if self.router_topk > 1:
                 global_local_mask = torch.ones_like(max_ind).bool()

@@ -883,7 +883,7 @@ if __name__ == "__main__":
     #============================= FASTERMOE =================================#
     # Prepare for the moe layer
     # fastermoe = MoE_layer_fastermoe(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    fastermoe = FMoETransformerMLP(num_expert=1, 
+    fastermoe = FMoETransformerMLP(num_expert=args.num_moe_experts//args.world_size, 
                                    d_model=args.hidden_size, 
                                    d_hidden=args.model_dim,
                                    world_size=WORLD_SIZE,

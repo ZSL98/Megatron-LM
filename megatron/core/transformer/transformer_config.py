@@ -21,6 +21,12 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # model architecture
     ####################
+    model_name: str = 'vanilla'
+    """Model name"""
+    
+    moe_layer_type: str = 'default'
+    """The MoE layer type, can be default, te, tutel, fastermoe, flux"""
+
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 

@@ -178,7 +178,6 @@ class MoELayer(BaseMoELayer):
 
         # process MoE
         def custom_forward(hidden_states):
-            # print("hidden_states: ", hidden_states.size())
             probs, indices = self.router(hidden_states)
             # print("indices: ", indices.size())
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
@@ -732,15 +731,15 @@ class MoELayer_uniform_distribution_mixtral(BaseMoELayer):
             )
         self.moe_layer_recompute = config.moe_layer_recompute
         device = torch.cuda.current_device()
-        self.fake_hidden_states = torch.rand((512, 1, 4096), dtype=torch.bfloat16, device=device)
+        self.fake_hidden_states = torch.rand((4096, 1, 4096), dtype=torch.bfloat16, device=device)
         # self.splits_cpu = torch.tensor([2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048], dtype=torch.int32, device=device)
         self.splits_cpu = torch.tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024], dtype=torch.int32, device=device)
         self.choosed_experts_all_token, _ = generate_scatter_index(
                 self.splits_cpu, 4096, config.moe_router_topk, device
             )
-        # print("choosed_experts_all_token: ", self.choosed_experts_all_token.size())
+        print("choosed_experts_all_token: ", self.choosed_experts_all_token.size())
         self.ep_rank = parallel_state.get_expert_model_parallel_rank()
-        token_per_rank = 512
+        token_per_rank = 4096
         # self.indices = self.choosed_experts_all_token[self.ep_rank * token_per_rank : (self.ep_rank+1) * token_per_rank].to(torch.int32).cuda()
         self.indices = self.choosed_experts_all_token[0 : token_per_rank].to(torch.int32).cuda()
         # print("self.indices: ", self.indices.size(), self.ep_rank)
@@ -765,7 +764,7 @@ class MoELayer_uniform_distribution_mixtral(BaseMoELayer):
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
                 self.fake_hidden_states, probs0, self.indices
             )
-            # print("dispatched_input: ", dispatched_input.size())
+            # print("dispatched_input:{}".format(dispatched_input.size()))
             # print("tokens_per_expert: ", tokens_per_expert)
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)

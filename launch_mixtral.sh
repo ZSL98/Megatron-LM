@@ -67,10 +67,11 @@ else
 fi
 
 MODEL_ARGS=(
+    --model-name mixtral
     --disable-bias-linear
     --seq-length 4096
     --max-position-embeddings 32768
-    --num-layers 32
+    --num-layers 16
     --hidden-size 4096
     --ffn-hidden-size 14336
     --num-attention-heads 32
@@ -89,11 +90,12 @@ MODEL_ARGS=(
 
 MOE_ARGS=(
     --num-experts 8
-    --expert-model-parallel-size 1
-    --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is aux_loss.
+    --expert-model-parallel-size 8
+    --moe-router-load-balancing-type none # options: aux_loss, sinkhorn, None. Default is aux_loss.
     --moe-router-topk 2
     --moe-aux-loss-coeff 1e-2
     --moe-grouped-gemm
+    --moe-layer-type te
 )
 
 TRAINING_ARGS=(
@@ -113,7 +115,7 @@ TRAINING_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 8
+    --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
     --sequence-parallel
     --use-distributed-optimizer
