@@ -128,6 +128,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                     global_indices <= self.local_expert_indices[-1]
                 )
                 local_indices = global_indices.masked_select(global_local_mask)
+                # print("global_indices: ", global_indices.size())
 
             if self.router_topk > 1:  # k > 1
                 global_probs = tensor_parallel.gather_from_sequence_parallel_region_to_moe(max_prob)
@@ -141,9 +142,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             )
             # Reshape global_local_mask to be compatible with Tensor.gather
             global_local_map = global_local_mask.nonzero()[:, 0]
+            # print("global_hidden_states: ", global_hidden_states.size())
             self.global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
             local_hidden_states = moe_gather.apply(global_hidden_states, self.global_local_map)
-            # print("local_hidden_states{}:{}".format(local_hidden_states.size(), torch.distributed.get_rank()))
+            # print("local_hidden_states {}:{}".format(local_hidden_states.size(), torch.distributed.get_rank()))
         else:
             if self.router_topk > 1:
                 global_local_mask = torch.ones_like(max_ind).bool()
@@ -180,6 +182,8 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             permuted_local_hidden_states = moe_gather.apply(local_hidden_states, self.indices)
         else:
             permuted_local_hidden_states = local_hidden_states
+        # print("permuted_local_hidden_states {}:{}".format(permuted_local_hidden_states.size(), torch.distributed.get_rank()))
+        
         return (
             permuted_local_hidden_states,
             tokens_per_expert,
@@ -205,7 +209,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             with shape of [SeqLen/TP, MBS, HiddenSize]
         """
         # if torch.distributed.get_rank() == 0:
-        #     print("token_unpermutation hidden_states: ", hidden_states)
+        #     print("token_unpermutation hidden_states: ", hidden_states.size())
         
         # Stage1: unpermute the tokens and bias locally respectively.
         scores = self.local_probs.to(dtype=hidden_states.dtype)

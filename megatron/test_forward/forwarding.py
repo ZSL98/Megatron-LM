@@ -246,7 +246,7 @@ def one_forward_step(
     # ) as prof:
 
     start_event.record()
-    iters = 5
+    iters = 1
     for _ in range(iters):
         forward_step_func(model, tokens, position_ids, attention_mask, labels)
     end_event.record()
@@ -255,7 +255,7 @@ def one_forward_step(
     elapsed_time = start_event.elapsed_time(end_event)
     print_rank_0("Forward time: {}".format(elapsed_time / iters))
 
-    # prof.export_chrome_trace(f"./traces/e2e_megatron_uniform_ep8_tp1_{RANK}.json")
+    # prof.export_chrome_trace(f"./traces/e2e_megatron_uniform_ep1_tp8_{RANK}.json")
 
 
 def update_train_iters(args):

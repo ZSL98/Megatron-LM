@@ -172,7 +172,7 @@ class GroupedMLP(MegatronModule):
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
     def forward(self, permuted_local_hidden_states, tokens_per_expert):
-        # print("GroupedMLP-rank: ", torch.distributed.get_rank())
+        # print("permuted_local_hidden_states: ", permuted_local_hidden_states.size())
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.
             w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
@@ -180,7 +180,7 @@ class GroupedMLP(MegatronModule):
 
             # if torch.distributed.get_rank() == 0:
             #     print("w1: ", w1.size(), w1)
-            
+            # print(" v: ", permuted_local_hidden_states.size())
             fc1_output = gg.ops.gmm(
                 permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
             )
@@ -198,6 +198,7 @@ class GroupedMLP(MegatronModule):
             # Make sure parameters still have gradients when no tokens are routed to this set of experts.
             w1 = self.weight1.view(self.config.hidden_size, -1)
             w2 = self.weight2.view(-1, self.config.hidden_size)
+            # print("permuted_local_hidden_states: ", permuted_local_hidden_states.size())
             h = torch.matmul(permuted_local_hidden_states, w1)
             h = self.activation_func(h)
             h = torch.matmul(h, w2)

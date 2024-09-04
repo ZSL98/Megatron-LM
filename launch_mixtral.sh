@@ -90,12 +90,12 @@ MODEL_ARGS=(
 
 MOE_ARGS=(
     --num-experts 8
-    --expert-model-parallel-size 8
+    --expert-model-parallel-size 1
     --moe-router-load-balancing-type none # options: aux_loss, sinkhorn, None. Default is aux_loss.
     --moe-router-topk 2
     --moe-aux-loss-coeff 1e-2
     --moe-grouped-gemm
-    --moe-layer-type te
+    --moe-layer-type default
 )
 
 TRAINING_ARGS=(
