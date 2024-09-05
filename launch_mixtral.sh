@@ -71,7 +71,7 @@ MODEL_ARGS=(
     --disable-bias-linear
     --seq-length 4096
     --max-position-embeddings 32768
-    --num-layers 16
+    --num-layers 32
     --hidden-size 4096
     --ffn-hidden-size 14336
     --num-attention-heads 32
@@ -126,11 +126,11 @@ CMD="torchrun \
   --node_rank=${node_rank} \
   --nproc_per_node=${nproc_per_node} \
   --nnodes=${nnodes} \
-  ${FLUX_EXTRA_TORCHRUN_ARGS} ${additional_args} $@ \
+  ${FLUX_EXTRA_TORCHRUN_ARGS} ${additional_args} test_forward_gpt.py\
   ${MODEL_ARGS[@]} \
   ${MOE_ARGS[@]} \
   ${TRAINING_ARGS[@]} \
-  ${MODEL_PARALLEL_ARGS[@]}"
+  ${MODEL_PARALLEL_ARGS[@]} $@ --model-name mixtral"
 
 echo ${CMD}
 ${CMD}

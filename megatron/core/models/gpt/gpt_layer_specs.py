@@ -12,22 +12,9 @@ from megatron.core.transformer.moe.moe_layer import (
     MoELayer_wo_te,
     MoELayer_uniform_distribution,
     MoELayer_flux_uniform_distribution,
-
-
-    MoELayer_uniform_distribution_mixtral, 
-    MoELayer_uniform_distribution_qwen2, 
-
-    MoELayer_flux_uniform_distribution_mixtral,
-    MoELayer_flux_uniform_distribution_qwen2,
-    MoELayer_flux_uniform_distribution_phi,
-
-    MoELayer_tutel_mixtral,
-    MoELayer_tutel_qwen2,
-    MoELayer_tutel_phi,
-
-    MoELayer_fastermoe_mixtral,
-    MoELayer_fastermoe_qwen2,
-    MoELayer_fastermoe_phi,
+    MoELayer_fastermoe,
+    MoELayer_tutel,
+    MoELayer_skip,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -152,19 +139,29 @@ def _get_mlp_module_spec(
 
         use_te_grouped_gemm = use_te and TEColumnParallelGroupedLinear is not None
 
-        moe_module = MoELayer_wo_te
-
-        if moe_layer_type == 'te':
+        if moe_layer_type == 'default':
+            MoELayer_uniform_distribution.seq_length = seq_length
+            MoELayer_uniform_distribution.split_num = split_num
+            MoELayer_uniform_distribution.use_te = False
+            moe_module = MoELayer_uniform_distribution 
+        elif moe_layer_type == 'te':
             MoELayer_uniform_distribution.seq_length = seq_length
             MoELayer_uniform_distribution.split_num = split_num
             moe_module = MoELayer_uniform_distribution
         elif moe_layer_type == 'flux':
             MoELayer_flux_uniform_distribution.seq_length = seq_length
+            MoELayer_flux_uniform_distribution.split_num = split_num
             moe_module = MoELayer_flux_uniform_distribution
         elif moe_layer_type == 'tutel':
-            moe_module = MoELayer_tutel_phi
+            MoELayer_tutel.seq_length = seq_length
+            MoELayer_tutel.split_num = split_num
+            moe_module = MoELayer_tutel
         elif moe_layer_type == 'fastermoe':
-            moe_module = MoELayer_fastermoe_phi
+            MoELayer_fastermoe.seq_length = seq_length
+            MoELayer_fastermoe.split_num = split_num
+            moe_module = MoELayer_fastermoe
+        elif moe_layer_type == 'skip':
+            moe_module = MoELayer_skip
 
 
         return ModuleSpec(

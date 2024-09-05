@@ -67,6 +67,7 @@ else
 fi
 
 MODEL_ARGS=(
+    --model-name phi
     --disable-bias-linear
     --seq-length 4096
     --max-position-embeddings 32768
@@ -89,11 +90,12 @@ MODEL_ARGS=(
 
 MOE_ARGS=(
     --num-experts 16
-    --expert-model-parallel-size 1
-    --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, None. Default is aux_loss.
+    --expert-model-parallel-size 4
+    --moe-router-load-balancing-type none # options: aux_loss, sinkhorn, None. Default is aux_loss.
     --moe-router-topk 2
     --moe-aux-loss-coeff 1e-2
     --moe-grouped-gemm
+    --moe-layer-type skip
 )
 
 TRAINING_ARGS=(
@@ -113,7 +115,7 @@ TRAINING_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 8
+    --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 1
     --sequence-parallel
     --use-distributed-optimizer
@@ -124,11 +126,11 @@ CMD="torchrun \
   --node_rank=${node_rank} \
   --nproc_per_node=${nproc_per_node} \
   --nnodes=${nnodes} \
-  ${FLUX_EXTRA_TORCHRUN_ARGS} ${additional_args} $@ \
+  ${FLUX_EXTRA_TORCHRUN_ARGS} ${additional_args} test_forward_gpt.py \
   ${MODEL_ARGS[@]} \
   ${MOE_ARGS[@]} \
   ${TRAINING_ARGS[@]} \
-  ${MODEL_PARALLEL_ARGS[@]}"
+  ${MODEL_PARALLEL_ARGS[@]} $@ --model-name phi"
 
 echo ${CMD}
 ${CMD}

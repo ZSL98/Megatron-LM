@@ -14,6 +14,7 @@ import torch.profiler
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+import csv
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import check_param_hashes_across_dp_replicas, get_model_config, StragglerDetector
@@ -205,7 +206,7 @@ def one_forward_step(
         get_position_embedding_ranks=get_position_embedding_ranks
     )
 
-    # args = get_args()
+    args = get_args()
     # timers = get_timers()
 
     # if args.log_progress:
@@ -246,15 +247,20 @@ def one_forward_step(
     # ) as prof:
 
     start_event.record()
-    iters = 1
+    iters = 10
     for _ in range(iters):
         forward_step_func(model, tokens, position_ids, attention_mask, labels)
     end_event.record()
     end_event.synchronize()
 
     elapsed_time = start_event.elapsed_time(end_event)
-    print_rank_0("Forward time: {}".format(elapsed_time / iters))
-
+    forward_time = elapsed_time / iters
+    print_rank_0("Forward time: {}".format(forward_time))
+    if RANK == 0:
+        csv_file = 'e2e_timing_results.csv'
+        with open(csv_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([args.model_name, args.moe_layer_type, args.expert_model_parallel_size, args.tensor_model_parallel_size, forward_time])
     # prof.export_chrome_trace(f"./traces/e2e_megatron_uniform_ep1_tp8_{RANK}.json")
 
 
