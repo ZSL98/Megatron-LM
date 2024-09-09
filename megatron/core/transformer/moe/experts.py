@@ -184,6 +184,8 @@ class GroupedMLP(MegatronModule):
             fc1_output = gg.ops.gmm(
                 permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
             )
+            # print("intermediate_parallel: ", fc1_output.size())
+            # print("permuted_local_hidden_states: ", permuted_local_hidden_states.size())
 
             # if torch.distributed.get_rank() == 0:
             #     print("fc1_output: ", fc1_output.size(), fc1_output)
@@ -433,6 +435,8 @@ class TEGroupedMLP(MegatronModule):
         intermediate_parallel, bias_parallel = self.linear_fc1(
             permuted_local_hidden_states, tokens_per_expert
         )
+        # print("intermediate_parallel: ", intermediate_parallel.size())
+        # print("permuted_local_hidden_states: ", permuted_local_hidden_states.size())
 
         if self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:

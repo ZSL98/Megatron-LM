@@ -261,7 +261,7 @@ def one_forward_step(
         with open(csv_file, mode='a', newline='') as file:
             writer = csv.writer(file)
             writer.writerow([args.model_name, args.moe_layer_type, args.expert_model_parallel_size, args.tensor_model_parallel_size, forward_time])
-    # prof.export_chrome_trace(f"./traces/e2e_megatron_uniform_ep1_tp8_{RANK}.json")
+    # prof.export_chrome_trace(f"./traces/e2e_qwen2_flux_uni_ep2_tp4_{RANK}.json")
 
 
 def update_train_iters(args):

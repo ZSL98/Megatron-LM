@@ -80,7 +80,6 @@ MODEL_ARGS=(
     --hidden-dropout 0.0
     --normalization RMSNorm
     --position-embedding-type rope
-    --swiglu
     --untie-embeddings-and-output-weights
     --group-query-attention
     --num-query-groups 8
