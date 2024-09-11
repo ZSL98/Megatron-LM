@@ -43,7 +43,7 @@
 #     done
 # done
 
-NUM_TOKENS=(4096) 
+NUM_TOKENS=(16384) 
 EXPERT_NUM=(32)
 TOPK=(2)
 TP_SIZE=(1)
@@ -56,7 +56,7 @@ for NUM_TOKENS in "${NUM_TOKENS[@]}"; do
                 echo "Running test with num_token=$NUM_TOKENS and num_moe_experts=$EXPERT_NUM"
                 
                 # Run the Python script with the current combination of arguments
-                ./launch.sh ./tests/unit_tests/transformer/moe/test_moe.py --num_tokens $NUM_TOKENS --num_moe_experts $EXPERT_NUM --topk $TOPK --tp_world_size $TP_SIZE --ep_world_size $((8 / TP_SIZE))
+                TP_SIZE=$TP_SIZE ./launch.sh ./tests/unit_tests/transformer/moe/test_moe.py --num_tokens $NUM_TOKENS --num_moe_experts $EXPERT_NUM --topk $TOPK --tp_world_size $TP_SIZE --ep_world_size $((8 / TP_SIZE))
                 
                 echo "Completed test with num_token=$NUM_TOKENS and num_moe_experts=$EXPERT_NUM"
             done

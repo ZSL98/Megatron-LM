@@ -89,7 +89,7 @@ OUT_DTYPE_MAP = {
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--dist", type=str, default="random")
+parser.add_argument("--dist", type=str, default="uniform")
 parser.add_argument('--local_rank', type=int, default=-1)
 parser.add_argument('--world_size', type=int, default=8)
 parser.add_argument('--ep_world_size', type=int, default=1)
@@ -333,7 +333,7 @@ class MoeMlp1Ctx:
             # input tensors
             self.inputs_shard = (
                 torch.rand((self.ntokens_shard, h), dtype=input_dtype, device=device)
-                * 0.01
+                * 0.02
                 * (self.tp_rank + 1)
             )
             self.weights = [
@@ -728,8 +728,8 @@ class MoE_layer_flux(torch.nn.Module):
 
         self.ctx.gelu_output = self.activation_func(self.ctx.outputs[0])
 
-        # if RANK == 2:
-        #     print("Flux gelu_output: ", self.ctx.gelu_output.size(), self.ctx.gelu_output)
+        if RANK == 2:
+            print("Flux gelu_output: ", self.ctx.gelu_output.size(), self.ctx.gelu_output)
         mlp_output = self.flux_rs_op.forward_gather_rs(
             self.ctx.gelu_output,
             self.ctx._weight,
@@ -775,7 +775,7 @@ if __name__ == "__main__":
         add_bias_linear=False,
         tensor_model_parallel_size=args.tp_world_size,
         expert_model_parallel_size=args.ep_world_size,
-        sequence_parallel=True,
+        sequence_parallel=False,
         tp_comm_overlap=True,
         moe_token_dispatcher_type="allgather"
     )
@@ -802,7 +802,8 @@ if __name__ == "__main__":
     # o1 = perf_flux(moe_ctx)
     # o2 = perf_torch(moe_ctx)
 
-    test_list = ['flux', 'tutel', 'fastermoe', 'megatron_te', 'megatron']
+    # test_list = ['flux', 'tutel', 'fastermoe', 'megatron_te', 'megatron']
+    test_list = ['flux', 'megatron']
     # test_list = ['megatron_te']
     profile_list = []
     profile_ctx = torch.profiler.profile(
@@ -889,14 +890,27 @@ if __name__ == "__main__":
                                    world_size=WORLD_SIZE,
                                    top_k=args.topk)
     fastermoe = fastermoe.cuda().to(torch.bfloat16)
-    input2 = torch.randn((args.num_tokens*args.batch_size//WORLD_SIZE, args.hidden_size), dtype=torch.bfloat16, device=device)
-    for i in range(warmup_iters):
-        _ = fastermoe(input2)
+
+    for name, param in fastermoe.named_parameters():
+        # print("name, param.size: ", name, " ", param.size())
+        if "htoh4.weight" in name:
+            # print("param.size: ", param.size())
+            param.data = moe_ctx.weights[0][int(name.split('.')[1])].unsqueeze(0)
+        if "h4toh.weight" in name:
+            param.data = moe_ctx._weight[int(name.split('.')[1])].unsqueeze(0)
+    input2 = moe_ctx.inputs_shard
+    if RANK == 7:
+        print("input2: ", input2, input2.size())
+    # input2 = torch.randn((args.num_tokens*args.batch_size//WORLD_SIZE, args.hidden_size), dtype=torch.bfloat16, device=device)
+
+    fastermoe_output = fastermoe(input2)
+    # for i in range(warmup_iters):
+    #     fastermoe_output = fastermoe(input2)
 
     def test_fastermoe(iters):
         start_event.record()
         for i in range(iters):
-            _ = fastermoe(input2)
+            fastermoe_output = fastermoe(input2)
         end_event.record()
         end_event.synchronize()
         elapsed_time_fastermoe = start_event.elapsed_time(end_event) / iters
@@ -905,7 +919,7 @@ if __name__ == "__main__":
 
     if 'fastermoe' in test_list:
         for i in range(warmup_iters):
-            _ = fastermoe(input2)
+            fastermoe_output = fastermoe(input2)
         test_fastermoe(iters)
         if 'fastermoe' in profile_list:
             with profile_ctx:
@@ -973,21 +987,22 @@ if __name__ == "__main__":
             writer = csv.writer(file)
             # Write header if file does not exist
             if not file_exists:
-                writer.writerow(['num_tokens', 'expert_num', 'topk', 'flux_time', 'tutel_time', 'fastermoe_time', 'megatron_time_te', 'megatron_time_wo_te'])
+                writer.writerow(['num_tokens', 'expert_num', 'topk', 'tp', 'flux_time', 'tutel_time', 'fastermoe_time', 'megatron_time_te', 'megatron_time_wo_te'])
             # Write the data
-            writer.writerow([args.num_tokens, args.num_moe_experts, args.topk, record['flux'], record['tutel'], record['fastermoe'], record['megatron_te'], record['megatron_wo_te']])
+            writer.writerow([args.num_tokens, args.num_moe_experts, args.topk, args.tp_world_size, record['flux'], record['tutel'], record['fastermoe'], record['megatron_te'], record['megatron_wo_te']])
 
-    # if RANK == 2 or RANK == 3 or RANK == 7:
-    #     if RANK == 2:
-    #         print("Flux output shape: ", output1.size(), output1)
-    #         print("Megatron output shape: ", output2.size(), output2)
+    if RANK == 2 or RANK == 3 or RANK == 7:
+        if RANK == 2:
+            print("Flux output shape: ", output1.size(), output1)
+            # print("Megatron output shape: ", output2.size(), output2)
+            print("FastMoE output shape: ", fastermoe_output.size(), fastermoe_output)
 
-    #     # print(count_unequal_elements(flux_gelu_output, megatron_gelu_output, 0.1))
-    #     # print(calculate_average_relative_error(flux_gelu_output, megatron_gelu_output))
-    #     # print(torch.sum(flux_gelu_output == 0))
-    #     # print(torch.equal(flux_gelu_output, megatron_gelu_output))
+        # print(count_unequal_elements(flux_gelu_output, megatron_gelu_output, 0.1))
+        # print(calculate_average_relative_error(flux_gelu_output, megatron_gelu_output))
+        # print(torch.sum(flux_gelu_output == 0))
+        # print(torch.equal(flux_gelu_output, megatron_gelu_output))
 
-    #     print(count_unequal_elements(output1, output2, 0.1))
-    #     print(calculate_average_relative_error(output1, output2))
-    #     print(torch.sum(output1 == 0))
-    #     print(torch.equal(output1, output2))
+        print(count_unequal_elements(output1, fastermoe_output, 0.1))
+        print(calculate_average_relative_error(output1, fastermoe_output))
+        # print(torch.sum(output1 == 0))
+        # print(torch.equal(output1, output2))
