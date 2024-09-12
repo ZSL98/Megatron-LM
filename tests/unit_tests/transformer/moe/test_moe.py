@@ -728,8 +728,8 @@ class MoE_layer_flux(torch.nn.Module):
 
         self.ctx.gelu_output = self.activation_func(self.ctx.outputs[0])
 
-        if RANK == 2:
-            print("Flux gelu_output: ", self.ctx.gelu_output.size(), self.ctx.gelu_output)
+        # if RANK == 2:
+        #     print("Flux gelu_output: ", self.ctx.gelu_output.size(), self.ctx.gelu_output)
         mlp_output = self.flux_rs_op.forward_gather_rs(
             self.ctx.gelu_output,
             self.ctx._weight,
@@ -775,7 +775,7 @@ if __name__ == "__main__":
         add_bias_linear=False,
         tensor_model_parallel_size=args.tp_world_size,
         expert_model_parallel_size=args.ep_world_size,
-        sequence_parallel=False,
+        sequence_parallel=False if args.tp_world_size == 1 else True,
         tp_comm_overlap=True,
         moe_token_dispatcher_type="allgather"
     )
@@ -803,7 +803,7 @@ if __name__ == "__main__":
     # o2 = perf_torch(moe_ctx)
 
     # test_list = ['flux', 'tutel', 'fastermoe', 'megatron_te', 'megatron']
-    test_list = ['flux', 'megatron']
+    test_list = ['flux', 'tutel', 'fastermoe', 'megatron_te', 'megatron']
     # test_list = ['megatron_te']
     profile_list = []
     profile_ctx = torch.profiler.profile(
@@ -823,8 +823,6 @@ if __name__ == "__main__":
     #============================= FLUX =================================#
     # Prepare for the moe layer
     flux_moe = MoE_layer_flux(transformer_config, moe_ctx).cuda().to(torch.bfloat16)
-    for i in range(warmup_iters):
-        output1, flux_gelu_output = flux_moe()
 
     def test_flux(iters):
         start_event.record()
@@ -855,17 +853,31 @@ if __name__ == "__main__":
             'count_per_node': args.num_moe_experts//args.world_size,
             'type': 'ffn', 
             'hidden_size_per_expert': args.model_dim, 
-            'activation_fn': lambda x: torch.nn.functional.silu(x)
+            'activation_fn': lambda x: torch.nn.functional.gelu(x)
         },
         scan_expert_func = lambda name, param: setattr(param, 'skip_allreduce', True),
     )
-    input = torch.randn((args.num_tokens*args.batch_size//WORLD_SIZE, args.hidden_size), dtype=torch.bfloat16, device=device)
+    tutel_input = moe_ctx.inputs_shard
+    # input = torch.randn((args.num_tokens*args.batch_size//WORLD_SIZE, args.hidden_size), dtype=torch.bfloat16, device=device)
     tutel_moe_layer = tutel_moe_layer.cuda().to(torch.bfloat16)
+
+    if args.tp_world_size == 1:
+        # The result correctness is only checked for tp=1, other cases weight sizes are not matched because weights are sharded
+        weight1_list = []
+        weight2_list = []
+        for i in range(args.num_moe_experts//args.world_size):
+            weight1_list.append(moe_ctx.weights[0][i].unsqueeze(0))
+            weight2_list.append(moe_ctx._weight[i].unsqueeze(0))
+        for name, param in tutel_moe_layer.named_parameters():
+            if "experts.batched_fc1_w" in name:
+                param.data = torch.cat(weight1_list, dim=0)
+            if "experts.batched_fc2_w" in name:
+                param.data = torch.cat(weight2_list, dim=0).permute(0, 2, 1)
 
     def test_tutel(iters):
         start_event.record()
         for i in range(iters):
-            _ = tutel_moe_layer(input)
+            tutel_output = tutel_moe_layer(tutel_input)
         end_event.record()
         end_event.synchronize()
         elapsed_time_tutel = start_event.elapsed_time(end_event) / iters
@@ -874,7 +886,7 @@ if __name__ == "__main__":
 
     if 'tutel' in test_list:
         for i in range(warmup_iters):
-            _ = tutel_moe_layer(input)
+            tutel_output = tutel_moe_layer(tutel_input)
         test_tutel(iters)
         if 'tutel' in profile_list:
             with profile_ctx:
@@ -891,26 +903,19 @@ if __name__ == "__main__":
                                    top_k=args.topk)
     fastermoe = fastermoe.cuda().to(torch.bfloat16)
 
-    for name, param in fastermoe.named_parameters():
-        # print("name, param.size: ", name, " ", param.size())
-        if "htoh4.weight" in name:
-            # print("param.size: ", param.size())
-            param.data = moe_ctx.weights[0][int(name.split('.')[1])].unsqueeze(0)
-        if "h4toh.weight" in name:
-            param.data = moe_ctx._weight[int(name.split('.')[1])].unsqueeze(0)
-    input2 = moe_ctx.inputs_shard
-    if RANK == 7:
-        print("input2: ", input2, input2.size())
+    if args.tp_world_size == 1:
+        for name, param in fastermoe.named_parameters():
+            if "htoh4.weight" in name:
+                param.data = moe_ctx.weights[0][int(name.split('.')[1])].unsqueeze(0)
+            if "h4toh.weight" in name:
+                param.data = moe_ctx._weight[int(name.split('.')[1])].unsqueeze(0)
+    fastmoe_input = moe_ctx.inputs_shard
     # input2 = torch.randn((args.num_tokens*args.batch_size//WORLD_SIZE, args.hidden_size), dtype=torch.bfloat16, device=device)
-
-    fastermoe_output = fastermoe(input2)
-    # for i in range(warmup_iters):
-    #     fastermoe_output = fastermoe(input2)
 
     def test_fastermoe(iters):
         start_event.record()
         for i in range(iters):
-            fastermoe_output = fastermoe(input2)
+            fastermoe_output = fastermoe(fastmoe_input)
         end_event.record()
         end_event.synchronize()
         elapsed_time_fastermoe = start_event.elapsed_time(end_event) / iters
@@ -919,7 +924,7 @@ if __name__ == "__main__":
 
     if 'fastermoe' in test_list:
         for i in range(warmup_iters):
-            fastermoe_output = fastermoe(input2)
+            fastermoe_output = fastermoe(fastmoe_input)
         test_fastermoe(iters)
         if 'fastermoe' in profile_list:
             with profile_ctx:
@@ -993,8 +998,9 @@ if __name__ == "__main__":
 
     if RANK == 2 or RANK == 3 or RANK == 7:
         if RANK == 2:
-            print("Flux output shape: ", output1.size(), output1)
-            # print("Megatron output shape: ", output2.size(), output2)
+            # print("Flux output shape: ", output1.size(), output1)
+            print("Megatron output shape: ", output2.size(), output2)
+            # print("Tutel output shape: ", tutel_output.size(), tutel_output)
             print("FastMoE output shape: ", fastermoe_output.size(), fastermoe_output)
 
         # print(count_unequal_elements(flux_gelu_output, megatron_gelu_output, 0.1))
@@ -1002,7 +1008,7 @@ if __name__ == "__main__":
         # print(torch.sum(flux_gelu_output == 0))
         # print(torch.equal(flux_gelu_output, megatron_gelu_output))
 
-        print(count_unequal_elements(output1, fastermoe_output, 0.1))
-        print(calculate_average_relative_error(output1, fastermoe_output))
+        print(count_unequal_elements(output2, fastermoe_output, 0.1))
+        print(calculate_average_relative_error(output2, fastermoe_output))
         # print(torch.sum(output1 == 0))
         # print(torch.equal(output1, output2))
