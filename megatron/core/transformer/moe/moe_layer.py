@@ -684,10 +684,21 @@ class MoELayer_flux_uniform_distribution(BaseMoELayer):
             MoELayer_flux_uniform_distribution.outputs = [torch.zeros((seq_length * dp_size * config.moe_router_topk // ep_world_size, self.config.ffn_hidden_size//tp_world_size), dtype=torch.bfloat16, device=device)]
             MoELayer_flux_uniform_distribution.weight2 = torch.rand((self.config.num_moe_experts // ep_world_size, self.config.hidden_size, self.config.ffn_hidden_size // tp_world_size), dtype=torch.bfloat16).cuda()
 
+        self.group = torch.distributed.group.WORLD
+
 
     def forward(self, hidden_states):
 
         probs0, indices0 = self.router(MoELayer_flux_uniform_distribution.fake_hidden_states.reshape(self.seq_length//self.split_num, 1, self.config.hidden_size))
+        probs0_dim_size = list(probs0.size())
+        probs0_dim_size[0] = probs0_dim_size[0] * 8
+        probs0_output = torch.empty(probs0_dim_size, dtype=probs0.dtype, device=torch.cuda.current_device())
+        indices0_dim_size = list(indices0.size())
+        indices0_dim_size[0] = indices0_dim_size[0] * 8
+        indices0_output = torch.empty(indices0_dim_size, dtype=indices0.dtype, device=torch.cuda.current_device())
+        torch.distributed._all_gather_base(probs0_output, probs0, self.group)
+        torch.distributed._all_gather_base(indices0_output, indices0, self.group)
+
         # print("fake_hidden_states: ", MoELayer_flux_uniform_distribution.fake_hidden_states.size())
         MoELayer_flux_uniform_distribution.flux_ag_op.forward_multiple_weights(
             inputs_shard=MoELayer_flux_uniform_distribution.fake_hidden_states,

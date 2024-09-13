@@ -708,6 +708,7 @@ class MoE_layer_flux(torch.nn.Module):
         self.flux_rs_op = flux.GemmGroupedV3GatherRS(args.num_moe_experts, flux_m_max, n_dim, args.topk, RANK, WORLD_SIZE, 
                                                 args.tp_world_size, args.ep_world_size, 1)
         self.reshaped_tensor = self.ctx.inputs_shard.reshape(num_tokens // WORLD_SIZE, batch_size, args.hidden_size)
+        self.group = torch.distributed.group.WORLD
 
     def forward(self):
 
@@ -716,6 +717,16 @@ class MoE_layer_flux(torch.nn.Module):
         #     print("indices: ", indices.size())
 
         probs0, indices0 = self.router(self.reshaped_tensor)
+
+        probs0_dim_size = list(probs0.size())
+        probs0_dim_size[0] = probs0_dim_size[0] * 8
+        probs0_output = torch.empty(probs0_dim_size, dtype=probs0.dtype, device=torch.cuda.current_device())
+        indices0_dim_size = list(indices0.size())
+        indices0_dim_size[0] = indices0_dim_size[0] * 8
+        indices0_output = torch.empty(indices0_dim_size, dtype=indices0.dtype, device=torch.cuda.current_device())
+        torch.distributed._all_gather_base(probs0_output, probs0, self.group)
+        torch.distributed._all_gather_base(indices0_output, indices0, self.group)
+
         self.flux_ag_op.forward_multiple_weights(
             inputs_shard=self.ctx.inputs_shard,
             weights=self.ctx.weights,
