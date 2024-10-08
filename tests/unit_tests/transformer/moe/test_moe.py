@@ -4,7 +4,7 @@ from torch import nn
 import torch.distributed as dist
 from typing import List, Union
 import flux
-from flux import pynvshmem
+# from flux import pynvshmem
 from flux import moe_utils
 from fmoe import FMoETransformerMLP
 from tutel.impls.moe_layer import MOELayer as tutel_moelayer
@@ -699,14 +699,20 @@ class MoE_layer_flux(torch.nn.Module):
             input_dtype=input_dtype,
             output_dtype=output_dtype,
         )
-        self.flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env, bf16_moe_args)
+
+        if flux.util.get_arch() >= 90:
+            self.flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env=tp_env, moe_args=bf16_moe_args)
+        else:
+            self.flux_ag_op = flux.GemmGroupedV2AGScatterOp(tp_env=tp_env, moe_args=bf16_moe_args)
 
         # if RANK == 0:
         #     print("eid_start, eid_end ", eid_start, " ", eid_end)
 
         n_dim = args.hidden_size # Check this!
-        self.flux_rs_op = flux.GemmGroupedV3GatherRS(args.num_moe_experts, flux_m_max, n_dim, args.topk, RANK, WORLD_SIZE, 
-                                                args.tp_world_size, args.ep_world_size, 1)
+        if flux.util.get_arch() >= 90:
+            self.flux_rs_op = flux.GemmGroupedV3GatherRS(args.num_moe_experts, flux_m_max, n_dim, args.topk, RANK, WORLD_SIZE, args.tp_world_size, args.ep_world_size, 1)
+        else:
+            self.flux_rs_op = flux.GemmGroupedV2GatherRSOp(TP_GROUP, args.num_moe_experts, flux_m_max, n_dim, args.topk, args.tp_world_size, args.ep_world_size, 1)
         self.reshaped_tensor = self.ctx.inputs_shard.reshape(num_tokens // WORLD_SIZE, batch_size, args.hidden_size)
         self.group = torch.distributed.group.WORLD
 
@@ -772,7 +778,7 @@ if __name__ == "__main__":
     transformer_config = TransformerConfig(
         num_layers=2,
         hidden_size=args.hidden_size,
-        ffn_hidden_size=args.hidden_size,
+        ffn_hidden_size=args.model_dim,
         num_attention_heads=8,
         num_moe_experts=args.num_moe_experts,
         use_cpu_initialization=True,
@@ -1009,17 +1015,17 @@ if __name__ == "__main__":
 
     if RANK == 2 or RANK == 3 or RANK == 7:
         if RANK == 2:
-            # print("Flux output shape: ", output1.size(), output1)
+            print("Flux output shape: ", output1.size(), output1)
             print("Megatron output shape: ", output2.size(), output2)
             # print("Tutel output shape: ", tutel_output.size(), tutel_output)
-            print("FastMoE output shape: ", fastermoe_output.size(), fastermoe_output)
+            # print("FastMoE output shape: ", fastermoe_output.size(), fastermoe_output)
 
         # print(count_unequal_elements(flux_gelu_output, megatron_gelu_output, 0.1))
         # print(calculate_average_relative_error(flux_gelu_output, megatron_gelu_output))
         # print(torch.sum(flux_gelu_output == 0))
         # print(torch.equal(flux_gelu_output, megatron_gelu_output))
 
-        print(count_unequal_elements(output2, fastermoe_output, 0.1))
-        print(calculate_average_relative_error(output2, fastermoe_output))
+        print(count_unequal_elements(fastermoe_output, output1, 0.1))
+        print(calculate_average_relative_error(fastermoe_output, output1))
         # print(torch.sum(output1 == 0))
         # print(torch.equal(output1, output2))

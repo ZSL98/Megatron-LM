@@ -44,9 +44,9 @@
 # done
 
 NUM_TOKENS=(8192) 
-EXPERT_NUM=(8 16 32 64)
-TOPK=(1 2 3 4 5)
-TP_SIZE=(8)
+EXPERT_NUM=(8)
+TOPK=(2)
+TP_SIZE=(1)
 
 # Loop over all combinations of num_token and num_moe_experts
 for num_tokens in "${NUM_TOKENS[@]}"; do

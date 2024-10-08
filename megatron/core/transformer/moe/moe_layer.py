@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 import torch
 import os
 import flux
-from flux import pynvshmem
+# from flux import pynvshmem
 from flux import moe_utils
 from fmoe import FMoETransformerMLP
 from tutel.impls.moe_layer import MOELayer as tutel_moelayer
@@ -667,9 +667,13 @@ class MoELayer_flux_uniform_distribution(BaseMoELayer):
         assert WORLD_SIZE == 8, "world size is not 8"
 
         if not MoELayer_flux_uniform_distribution._initialized:
-            MoELayer_flux_uniform_distribution.flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env, bf16_moe_args)
-            MoELayer_flux_uniform_distribution.flux_rs_op = flux.GemmGroupedV3GatherRS(config.num_moe_experts, flux_m_max, config.hidden_size, 
-                                                        config.moe_router_topk, RANK, WORLD_SIZE, tp_world_size, ep_world_size, 1)
+            if flux.util.get_arch() >= 90:
+                MoELayer_flux_uniform_distribution.flux_ag_op = flux.GemmGroupedV3AGScatter(tp_env, bf16_moe_args)
+                MoELayer_flux_uniform_distribution.flux_rs_op = flux.GemmGroupedV3GatherRS(config.num_moe_experts, flux_m_max, config.hidden_size, 
+                                                            config.moe_router_topk, RANK, WORLD_SIZE, tp_world_size, ep_world_size, 1)
+            else:
+                MoELayer_flux_uniform_distribution.flux_ag_op = flux.GemmGroupedV2AGScatterOp(tp_env, bf16_moe_args)
+                MoELayer_flux_uniform_distribution.flux_rs_op = flux.GemmGroupedV2GatherRSOp(TP_GROUP, config.num_moe_experts, flux_m_max, config.hidden_size, config.moe_router_topk, tp_world_size, ep_world_size, 1)
             MoELayer_flux_uniform_distribution._initialized = True
 
             MoELayer_flux_uniform_distribution.fake_hidden_states = torch.rand((seq_length//split_num, config.hidden_size), dtype=torch.bfloat16, device=device)
