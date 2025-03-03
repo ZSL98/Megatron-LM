@@ -1,13 +1,7 @@
 #!/bin/bash
 
-# TP_SIZE=(1 2 4 8)
-# MOE_LAYER_TYPE=(default te tutel fastermoe flux skip)
-# NUM_TOKENS=(8192 4096)
-# TP_SIZE=(1 2 4 8)
-# MOE_LAYER_TYPE=(default te tutel fastermoe flux skip)
-
 NUM_TOKENS=(8192)
-TP_SIZE=(4 2 1)
+TP_SIZE=(8)
 MOE_LAYER_TYPE=(default te tutel fastermoe flux skip)
 
 # Loop over all combinations of num_token and num_moe_experts
